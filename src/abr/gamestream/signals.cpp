@@ -46,6 +46,10 @@ constexpr int64_t kSampleGapUs = 40000;
 constexpr int64_t kDelayFreshUs = 500000;
 constexpr int64_t kDelayRecentUs = 100000;
 
+// How far back the video's delay is looked at to tell whether a rise of the round trip was a queue that
+// has since emptied: ENet's smoothing keeps the round trip high for about this long after it.
+constexpr int64_t kDelayPeakUs = 1500000;
+
 // A rise of the smoothed round trip that the video's delay does not show counts as path noise when it
 // is over kStallMinMs, for kStallHoldUs.
 constexpr double kStallMinMs = 10;
@@ -519,16 +523,19 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
   // leaves no queue behind, raises neither.
   prune_floor(delays_);
   if (!delays_.empty() && now_us - delays_.back().t_us <= kDelayFreshUs) {
-    double recent = delays_.back().v, delay_min = recent;
+    double recent = delays_.back().v, delay_min = recent, peak = recent;
     for (const Sample& x : delays_) {
       delay_min = std::min(delay_min, x.v);
+      if (delays_.back().t_us - x.t_us <= kDelayPeakUs) peak = std::max(peak, x.v);
       if (delays_.back().t_us - x.t_us <= kDelayRecentUs) recent = std::min(recent, x.v);
     }
     const double allowed = 2.0 * std::max(0.0, recent - delay_min);
     // What the round trip rose and the video did not is a rise of the path that came back by itself:
-    // noise, for as long as ENet's smoothing takes to forget it.
-    if (rise_ms - allowed > kStallMinMs) {
-      stall_ms_ = rise_ms - allowed;
+    // noise, for as long as ENet's smoothing takes to forget it. If the video's delay did rise lately, it
+    // is the tail of a queue that emptied, which is not noise even though the cap above already cuts it.
+    const double shown = std::max(allowed, 2.0 * std::max(0.0, peak - delay_min));
+    if (rise_ms - shown > kStallMinMs) {
+      stall_ms_ = rise_ms - shown;
       stall_us_ = now_us;
     }
     rise_ms = std::min(rise_ms, allowed);
