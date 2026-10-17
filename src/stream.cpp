@@ -91,6 +91,27 @@ namespace stream {
   constexpr double estimated_audio_bps = 300000.0;
 
   /**
+   * @brief The last unsmoothed ENet round trip measured on a peer, in milliseconds.
+   *
+   * Stock ENet only keeps the smoothed round trip, which trails a change in the queue by several
+   * acknowledgements. An ENet that also stores the raw sample of each acknowledgement as
+   * `roundTripTimeSample` lets the controller see the queue as it grows; without it the smoothed
+   * value is used, and the controller reacts later.
+   *
+   * @tparam Peer ENet peer type.
+   * @param peer Peer of the control stream.
+   * @return Round trip sample in milliseconds.
+   */
+  template<typename Peer>
+  double enet_rtt_sample_ms(const Peer &peer) {
+    if constexpr (requires { peer.roundTripTimeSample; }) {
+      return peer.roundTripTimeSample;
+    } else {
+      return peer.roundTripTime;
+    }
+  }
+
+  /**
    * @brief Enumerates supported socket options.
    */
   enum class socket_e : int {
@@ -1398,12 +1419,12 @@ namespace stream {
               if (session->adaptive->enet_ping_due(now)) {
                 enet_peer_ping(session->control.peer);
               }
-              session->adaptive->enet_sample(now, session->control.peer->roundTripTimeSample);
+              session->adaptive->enet_sample(now, enet_rtt_sample_ms(*session->control.peer));
               if (auto divider = session->adaptive->take_frame_divider()) {
                 session->video.frame_divider_events->raise(divider);
               }
               adaptive_active = true;
-              session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0, session->control.peer->roundTripTimeSample / 1000.0);
+              session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0, enet_rtt_sample_ms(*session->control.peer) / 1000.0);
               if (auto kbps = session->adaptive->bitrate_to_apply(now)) {
                 session->video.bitrate_events->raise(kbps);
               }
@@ -1712,16 +1733,24 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps, or the adaptive controller's pacing rate if it is lower
-        double pacing_bps = std::giga::num * 0.8;
-        if (session->adaptive) {
-          const double adaptive_pacing = session->adaptive->pacing_bps();
-          if (adaptive_pacing > 0) {
-            pacing_bps = std::min(pacing_bps, adaptive_pacing);
-          }
+        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
+        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+
+        // The adaptive controller paces below that when its rate is lower
+        const double adaptive_pacing_bps = session->adaptive ? session->adaptive->pacing_bps() : 0.0;
+        const bool adaptive_paced = adaptive_pacing_bps > 0 && adaptive_pacing_bps < std::giga::num * 0.8;
+        std::chrono::nanoseconds ratecontrol_packet_time {};
+        if (adaptive_paced) {
+          ratecontrol_packet_time = std::chrono::nanoseconds(static_cast<std::int64_t>(blocksize * 8 * 1e9 / adaptive_pacing_bps));
+          ratecontrol_packets_in_1ms = std::max<std::int64_t>(1, std::chrono::nanoseconds(1ms) / ratecontrol_packet_time);
         }
-        const auto ratecontrol_packet_time = std::chrono::nanoseconds(static_cast<std::int64_t>(blocksize * 8 * 1e9 / pacing_bps));
-        size_t ratecontrol_packets_in_1ms = std::max<std::int64_t>(1, std::chrono::nanoseconds(1ms) / ratecontrol_packet_time);
+        // How long after the start of the frame the given number of its packets is due
+        auto ratecontrol_offset = [&](size_t packets_sent) {
+          if (adaptive_paced) {
+            return ratecontrol_packet_time * packets_sent;
+          }
+          return std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) * packets_sent / ratecontrol_packets_in_1ms;
+        };
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -1732,9 +1761,11 @@ namespace stream {
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
-        // And no more than a millisecond's worth at the pacing rate, or the pacing is lost
+        // And no more than a millisecond's worth at the adaptive pacing rate, or the pacing is lost
         // inside the batch
-        send_batch_size = std::min(send_batch_size, ratecontrol_packets_in_1ms);
+        if (adaptive_paced) {
+          send_batch_size = std::min(send_batch_size, ratecontrol_packets_in_1ms);
+        }
 
         // Don't ignore the last ratecontrol group of the previous frame
         const auto ratecontrol_now = std::chrono::steady_clock::now();
@@ -1873,7 +1904,7 @@ namespace stream {
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
               if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
-                auto due = ratecontrol_frame_start + ratecontrol_packet_time * ratecontrol_frame_packets_sent;
+                auto due = ratecontrol_frame_start + ratecontrol_offset(ratecontrol_frame_packets_sent);
 
                 auto now = std::chrono::steady_clock::now();
                 if (now < due) {
@@ -1921,7 +1952,7 @@ namespace stream {
           }
 
           // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start + ratecontrol_packet_time * ratecontrol_frame_packets_sent;
+          ratecontrol_next_frame_start = ratecontrol_frame_start + ratecontrol_offset(ratecontrol_frame_packets_sent);
 
           frame_network_latency_logger.second_point_now_and_log();
 

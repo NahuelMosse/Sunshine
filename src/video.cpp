@@ -50,6 +50,14 @@ namespace video {
 
   namespace {
     /**
+     * @brief Whether the adaptive bitrate controller repairs losses by invalidating references.
+     * @return True in the adaptive bitrate modes that act on the stream.
+     */
+    bool adaptive_repairs() {
+      return config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    }
+
+    /**
      * @brief ESTAB_CODIFICADOR_FIJO: ensayo temporal del sandbox, se saca antes del PR.
      *
      * Trata a libx264 como a los codificadores que no cambian el bitrate en caliente, para probar
@@ -2173,7 +2181,7 @@ namespace video {
         } else {
           BOOST_LOG(warning) << "Client requested reference frame limit, but encoder doesn't support it!"sv;
         }
-      } else if (std::string_view {codec->name} == "libx264"sv) {
+      } else if (adaptive_repairs() && std::string_view {codec->name} == "libx264"sv) {
         // libx264 invalidates references by no longer using them, so it needs older ones to
         // predict from; with a single reference every lost frame would cost an IDR frame
         ctx->refs = 4;
@@ -2356,7 +2364,7 @@ namespace video {
 
       // Keep the frames sent over the last round trip decodable as references, so that after a
       // loss the next frame can be predicted from one the client still has
-      if (ctx->refs > 1 && std::string_view {codec->name} == "libx264"sv) {
+      if (adaptive_repairs() && ctx->refs > 1 && std::string_view {codec->name} == "libx264"sv) {
         auto *existing = av_dict_get(options, "x264-params", nullptr, 0);
         av_dict_set(&options, "x264-params", existing ? ":dpb-size=16" : "dpb-size=16", existing ? AV_DICT_APPEND : 0);
       }
