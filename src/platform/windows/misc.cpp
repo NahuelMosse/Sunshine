@@ -1437,6 +1437,12 @@ namespace platf {
   // Use UDP segmentation offload if it is supported by the OS. If the NIC is capable, this will use
   // hardware acceleration to reduce CPU usage. Support for USO was introduced in Windows 10 20H1.
   bool send_batch(batched_send_info_t &send_info) {
+    // ESTAB: interruptor temporal del banco, se saca antes del PR. El tráfico que vuelve a esta
+    // misma PC dando la vuelta por WSL pierde los segmentos de un envío con USO.
+    static const bool sin_uso = std::getenv("SUNSHINE_SIN_USO") != nullptr;
+    if (sin_uso) {
+      return false;
+    }
     WSAMSG msg;
 
     // Convert the target address into a SOCKADDR

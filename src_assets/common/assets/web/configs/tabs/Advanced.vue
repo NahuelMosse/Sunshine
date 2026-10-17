@@ -20,6 +20,18 @@ const config = ref(props.config)
       <div class="form-text">{{ $t('config.fec_percentage_desc') }}</div>
     </div>
 
+    <!-- Adaptive Bitrate -->
+    <div class="mb-3">
+      <label for="adaptive_bitrate" class="form-label">{{ $t('config.adaptive_bitrate') }}</label>
+      <select id="adaptive_bitrate" class="form-select" v-model="config.adaptive_bitrate">
+        <option value="disabled">{{ $t('config.adaptive_bitrate_disabled') }}</option>
+        <option value="shadow">{{ $t('config.adaptive_bitrate_shadow') }}</option>
+        <option value="fec">{{ $t('config.adaptive_bitrate_fec') }}</option>
+        <option value="full">{{ $t('config.adaptive_bitrate_full') }}</option>
+      </select>
+      <div class="form-text">{{ $t('config.adaptive_bitrate_desc') }}</div>
+    </div>
+
     <!-- Quantization Parameter -->
     <div class="mb-3">
       <label for="qp" class="form-label">{{ $t('config.qp') }}</label>

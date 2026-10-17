@@ -1995,6 +1995,47 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Runs a delay-based rate controller on each session, fed by per-frame arrival reports
+            from the client. It needs a client that sends frame train reports; with other clients it
+            stays off.
+            @note{Changing the bitrate during a session needs an encoder that supports it: NVENC on
+            GPUs that report dynamic bitrate change, and libx264. Other encoders keep the bitrate the
+            client asked for.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>disabled</td>
+        <td>The controller does not run.</td>
+    </tr>
+    <tr>
+        <td>shadow</td>
+        <td>The controller runs and logs the bitrate and FEC it would use, without changing anything.</td>
+    </tr>
+    <tr>
+        <td>fec</td>
+        <td>Like shadow, and it also sets the FEC percentage of every frame, overriding
+            [fec_percentage](#fec_percentage).</td>
+    </tr>
+    <tr>
+        <td>full</td>
+        <td>Like fec, and it also changes the encoder bitrate. It never goes above the bitrate the
+            client asked for.</td>
+    </tr>
+</table>
+
 ### qp
 
 <table>

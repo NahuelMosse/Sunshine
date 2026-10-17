@@ -4,6 +4,9 @@
  */
 #pragma once
 
+// standard includes
+#include <array>
+
 // local includes
 #include "nvenc_colorspace.h"
 #include "nvenc_config.h"
@@ -75,6 +78,14 @@ namespace NVENC_NAMESPACE {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
+    /**
+     * @brief Change the target bitrate with `nvEncReconfigureEncoder()`, keeping the encoder,
+     *        its reference frames and the VBV size in frames.
+     * @param kbps New target bitrate in kilobits per second.
+     * @return `true` on success, `false` if the GPU does not support dynamic bitrate or the call failed.
+     */
+    bool set_bitrate(std::uint32_t kbps) override;
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -128,6 +139,8 @@ namespace NVENC_NAMESPACE {
       NV_ENC_BUFFER_FORMAT buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
       uint32_t ref_frames_in_dpb = 0;
       bool rfi = false;
+      int video_format = 0;  ///< 0 H.264, 1 HEVC, 2 AV1.
+      uint32_t ltr_frames = 0;  ///< Long-term reference slots kept for repairs, 0 without them.
     } encoder_params;  ///< Current encoder dimensions, pixel format, and reference-frame settings.
 
     std::string last_nvenc_error_string;  ///< Last NVENC error string.
@@ -216,6 +229,16 @@ namespace NVENC_NAMESPACE {
      * @param buffer_format Selected NVENC input format.
      * @param encode_guid Selected codec GUID.
      */
+    /**
+     * @brief Keep long-term reference slots for repairs, with the adaptive bitrate controller.
+     *
+     * @tparam FormatConfig Codec-specific NVENC configuration type.
+     * @param format_config Codec-specific encoder configuration to update.
+     * @param encode_guid Selected codec GUID.
+     */
+    template<typename FormatConfig>
+    void configure_long_term_references(FormatConfig &format_config, const GUID &encode_guid);
+
     template<typename FormatConfig>
     void configure_h264_hevc_metadata(
       FormatConfig &format_config,
@@ -331,9 +354,24 @@ namespace NVENC_NAMESPACE {
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
 
     struct {
+      bool supported = false;  ///< GPU reports NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE.
+      NV_ENC_INITIALIZE_PARAMS init_params = {};  ///< Parameters the encoder was initialized with.
+      NV_ENC_CONFIG enc_config = {};  ///< Configuration `init_params.encodeConfig` points to.
+      std::uint32_t initial_bitrate = 0;  ///< Bitrate at initialization, in bits per second.
+      std::uint32_t initial_vbv = 0;  ///< VBV buffer size at initialization, in bits.
+    } reconfigure_state;  ///< What `set_bitrate()` needs to rebuild the parameters.
+
+    struct ltr_slot_t {
+      uint64_t frame_index = 0;  ///< Frame marked into the slot.
+      bool valid = false;  ///< The client has decoded it: marked before any loss since.
+    };
+
+    struct {
       uint64_t last_encoded_frame_index = 0;
       bool rfi_needs_confirmation = false;
       std::pair<uint64_t, uint64_t> last_rfi_range;
+      std::array<ltr_slot_t, 4> ltr {};  ///< Long-term reference slots, the first encoder_params.ltr_frames in use.
+      int ltr_use = -1;  ///< Slot the next frame has to predict from, after a repair too large for the DPB.
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
     } encoder_state;
   };
