@@ -23,6 +23,8 @@ extern "C" {
   #include <ffnvcodec/nvEncodeAPI.h>
 #endif
 }
+#include <cstdint>
+#include <x264.h>
 
 // local includes
 #include "cbs.h"
@@ -47,6 +49,14 @@ using namespace std::literals;
 namespace video {
 
   namespace {
+    /**
+     * @brief Whether the adaptive bitrate controller repairs losses by invalidating references.
+     * @return True in the adaptive bitrate modes that act on the stream.
+     */
+    bool adaptive_repairs() {
+      return config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    }
+
     /**
      * @brief Check if we can allow probing for the encoders.
      * @return True if there should be no issues with the probing, false if we should prevent it.
@@ -524,8 +534,105 @@ namespace video {
      * @param last_frame Last frame.
      */
     void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
-      BOOST_LOG(error) << "Encoder doesn't support reference frame invalidation";
-      request_idr_frame();
+      if (!x264_handle()) {
+        BOOST_LOG(error) << "Encoder doesn't support reference frame invalidation";
+        request_idr_frame();
+        return;
+      }
+      // The client keeps asking from the same first frame while it finds more frames lost behind
+      // it, frames that were already in flight when the first request was handled. As with NVENC,
+      // the range done reaches the last frame encoded then, and what falls inside it is done:
+      // invalidating again would also drop the frames predicted since from an older reference.
+      if (first_frame >= rfi_range.first && last_frame <= rfi_range.second) {
+        return;
+      }
+      const auto from = first_frame >= rfi_range.first && first_frame <= rfi_range.second ? rfi_range.second + 1 : first_frame;
+      rfi_range = {first_frame, std::max(last_frame, last_encoded_frame)};
+      // Applied right before the next frame goes to the encoder, on the encoding thread
+      pending_invalidation = pending_invalidation < 0 ? from : std::min(pending_invalidation, from);
+    }
+
+    /**
+     * @brief The libx264 encoder behind the FFmpeg context, or null for any other encoder.
+     *
+     * FFmpeg's libx264 wrapper keeps the handle in its private context, right after its AVClass
+     * pointer and the x264 parameters, and offers no way to invalidate references through
+     * avcodec. The parameters must agree with the context for the handle to be trusted.
+     *
+     * @return The encoder handle, or null.
+     */
+    x264_t *x264_handle() const {
+      if (!avcodec_ctx || !avcodec_ctx->codec || std::string_view {avcodec_ctx->codec->name} != "libx264"sv || !avcodec_ctx->priv_data) {
+        return nullptr;
+      }
+
+      struct x264_context_prefix {
+        const AVClass *av_class;
+        x264_param_t params;
+        x264_t *enc;
+      };
+
+      const auto *priv = static_cast<const x264_context_prefix *>(avcodec_ctx->priv_data);
+      if (priv->params.i_width != avcodec_ctx->width || priv->params.i_height != avcodec_ctx->height || priv->params.i_frame_reference < 2) {
+        return nullptr;
+      }
+      return priv->enc;
+    }
+
+    int64_t pending_invalidation = -1;  ///< First frame whose references the client lost, if any.
+    std::pair<int64_t, int64_t> rfi_range {-1, -1};  ///< The frames already invalidated.
+    int64_t last_encoded_frame = -1;  ///< The last frame handed to the encoder.
+    bool mark_after_invalidation = false;  ///< Whether the next frame out is the one that follows it.
+
+    /**
+     * @brief Change the bitrate by editing the codec context between frames.
+     *
+     * FFmpeg has no general API for this. The libx264 wrapper compares the context with what the
+     * encoder was configured with on every frame and reconfigures it in place when they differ.
+     * The NVENC wrapper does too, but resets the encoder and forces an IDR frame to do it, and the
+     * QuickSync one drains and resets it; AMF, VAAPI, Vulkan, VideoToolbox, MediaFoundation,
+     * libx265 and SVT-AV1 ignore the change. All of those report it as unsupported.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder will pick up the change.
+     */
+    bool set_bitrate(int kbps) override {
+      if (!avcodec_ctx || !avcodec_ctx->codec || kbps <= 0) {
+        return false;
+      }
+      const std::string_view name {avcodec_ctx->codec->name};
+      const bool reconfigurable = name == "libx264"sv;
+      if (!reconfigurable) {
+        return false;
+      }
+
+      auto &ctx = *avcodec_ctx;
+      const int64_t bitrate = int64_t(kbps) * 1000;
+      const int64_t previous = ctx.rc_max_rate > 0 ? ctx.rc_max_rate : ctx.bit_rate;
+      if (previous <= 0 || previous == bitrate) {
+        return previous == bitrate;
+      }
+
+      // Keep every rate-control field in the same proportion it was opened with: the
+      // one-off difference between bit_rate and rc_max_rate that forces VBR, and the VBV
+      // size in frames
+      const int64_t vbr_offset = ctx.rc_max_rate - ctx.bit_rate;
+      ctx.rc_max_rate = bitrate;
+      ctx.bit_rate = bitrate - vbr_offset;
+      if (ctx.rc_min_rate > 0) {
+        ctx.rc_min_rate = bitrate;
+      }
+      if (ctx.rc_buffer_size > 0) {
+        ctx.rc_buffer_size = static_cast<int>(int64_t(ctx.rc_buffer_size) * bitrate / previous);
+      }
+      return true;
+    }
+
+    int opened_bitrate_kbps() const override {
+      if (!avcodec_ctx) {
+        return 0;
+      }
+      return static_cast<int>((avcodec_ctx->rc_max_rate > 0 ? avcodec_ctx->rc_max_rate : avcodec_ctx->bit_rate) / 1000);
     }
 
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
@@ -597,6 +704,10 @@ namespace video {
       }
     }
 
+    bool set_bitrate(int kbps) override {
+      return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
     /**
      * @brief Submit the next frame to NVENC and return the encoded payload.
      *
@@ -632,6 +743,9 @@ namespace video {
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     stream::session_t *channel_data;  ///< Stream session forwarded to packet senders.
+    safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new target bitrate in kbps.
+    safe::mail_raw_t::event_t<int> bitrate_fixed_events;  ///< Event saying the encoder keeps its bitrate, in kbps.
+    bool bitrate_fixed_reported = false;  ///< Whether that was already said for this encoder.
   };
 
   /**
@@ -1224,7 +1338,7 @@ namespace video {
       "libx264"s,
       {},  // capabilities
     },
-    H264_ONLY | PARALLEL_ENCODING | ALWAYS_REPROBE | YUV444_SUPPORT
+    H264_ONLY | PARALLEL_ENCODING | ALWAYS_REPROBE | YUV444_SUPPORT | REF_FRAMES_INVALIDATION
   };
 
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
@@ -1469,6 +1583,22 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+
+  bool changes_bitrate_in_place(int video_format) {
+    if (!chosen_encoder) {
+      return false;
+    }
+#ifdef _WIN32
+    // The standalone NVENC encoder; on Linux the encoder of this name is FFmpeg's, which resets
+    if (chosen_encoder->name == "nvenc"sv) {
+      return true;
+    }
+#endif
+    const auto &codec = video_format == 2 ? chosen_encoder->av1 : video_format == 1 ? chosen_encoder->hevc :
+                                                                                      chosen_encoder->h264;
+    return codec.name == "libx264"sv;
+  }
+
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
@@ -1836,7 +1966,21 @@ namespace video {
     auto &sps = session.sps;
     auto &vps = session.vps;
 
+    // The client lost frames and asked to stop referencing them: libx264 drops them from its
+    // references, and this frame is predicted from an older one the client still has
+    if (session.pending_invalidation >= 0) {
+      auto *x264 = session.x264_handle();
+      const int result = x264 ? x264_encoder_invalidate_reference(x264, session.pending_invalidation) : -1;
+      if (result == 0) {
+        session.mark_after_invalidation = true;
+      } else {
+        session.request_idr_frame();
+      }
+      session.pending_invalidation = -1;
+    }
+
     // send the frame to the encoder
+    session.last_encoded_frame = frame_nr;
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
       std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
@@ -1891,6 +2035,10 @@ namespace video {
 
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
+        if (session.mark_after_invalidation) {
+          packet->after_ref_frame_invalidation = !(av_packet->flags & AV_PKT_FLAG_KEY);
+          session.mark_after_invalidation = false;
+        }
       }
 
       packet->replacements = &session.replacements;
@@ -2075,6 +2223,10 @@ namespace video {
         } else {
           BOOST_LOG(warning) << "Client requested reference frame limit, but encoder doesn't support it!"sv;
         }
+      } else if (adaptive_repairs() && std::string_view {codec->name} == "libx264"sv) {
+        // libx264 invalidates references by no longer using them, so it needs older ones to
+        // predict from; with a single reference every lost frame would cost an IDR frame
+        ctx->refs = 4;
       }
 
       // We forcefully reset the flags to avoid clash on reuse of AVCodecContext
@@ -2252,6 +2404,13 @@ namespace video {
       // Allow the encoding device a final opportunity to set/unset or override any options
       encode_device->init_codec_options(ctx.get(), &options);
 
+      // Keep the frames sent over the last round trip decodable as references, so that after a
+      // loss the next frame can be predicted from one the client still has
+      if (adaptive_repairs() && ctx->refs > 1 && std::string_view {codec->name} == "libx264"sv) {
+        auto *existing = av_dict_get(options, "x264-params", nullptr, 0);
+        av_dict_set(&options, "x264-params", existing ? ":dpb-size=16" : "dpb-size=16", existing ? AV_DICT_APPEND : 0);
+      }
+
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
 
@@ -2389,6 +2548,38 @@ namespace video {
   }
 
   /**
+   * @brief Apply the latest bitrate requested by the adaptive bitrate controller, if any.
+   *
+   * Runs on the encoder thread between frames, which is the only place the encoder can be
+   * reconfigured safely.
+   *
+   * An encoder that cannot change it says so once, with the bitrate it keeps, so the controller
+   * paces the frame rate instead.
+   *
+   * @param session Running encode session.
+   * @param events Bitrate events for this stream.
+   * @param fixed_events Where to say the encoder keeps its bitrate.
+   * @param fixed_reported Whether that was already said for this encoder.
+   */
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported) {
+    if (!events || !events->peek()) {
+      return;
+    }
+    if (auto kbps = events->pop(0ms)) {
+      if (session.set_bitrate(*kbps)) {
+        BOOST_LOG(debug) << "Encoder bitrate set to "sv << *kbps << " kbps"sv;
+      } else if (!fixed_reported) {
+        fixed_reported = true;
+        const int opened = session.opened_bitrate_kbps();
+        BOOST_LOG(info) << "Encoder cannot change bitrate during the session: keeping "sv << opened << " kbps and pacing the frame rate"sv;
+        if (fixed_events && opened > 0) {
+          fixed_events->raise(opened);
+        }
+      }
+    }
+  }
+
+  /**
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
@@ -2443,6 +2634,13 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<int>(mail::bitrate);
+    auto bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
+    bool bitrate_fixed_reported = false;
+    auto frame_divider_events = mail->event<int>(mail::frame_divider);
+    // The share of captured frames to encode, and what has accumulated of it since the last one
+    double frames_kept = 1.0;
+    double frames_owed = 0.0;
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2473,11 +2671,29 @@ namespace video {
         session->request_idr_frame();
       }
 
+      apply_requested_bitrate(*session, bitrate_events, bitrate_fixed_events, bitrate_fixed_reported);
+
+      if (frame_divider_events->peek()) {
+        if (auto per_mille = frame_divider_events->pop(0ms)) {
+          frames_kept = std::clamp(*per_mille / 1000.0, 0.001, 1.0);
+        }
+      }
+
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          // Behind a long queue the adaptive bitrate controller asks for fewer frames, so that a
+          // loss stays repairable, and with an encoder that keeps its bitrate the share of frames
+          // carries the budget (adaptive_bitrate::session_t::take_frame_divider)
+          if (!requested_idr_frame && frames_kept < 1.0) {
+            frames_owed += frames_kept;
+            if (frames_owed < 1.0) {
+              continue;
+            }
+            frames_owed -= 1.0;
+          }
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
@@ -2781,6 +2997,8 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          apply_requested_bitrate(*pos->session, ctx->bitrate_events, ctx->bitrate_fixed_events, ctx->bitrate_fixed_reported);
+
           if (frame_captured && pos->session->convert(*captured_image)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
@@ -2988,6 +3206,8 @@ namespace video {
         config,
         1,
         channel_data,
+        mail->event<int>(mail::bitrate),
+        mail->event<int>(mail::bitrate_fixed),
       });
 
       // Wait for join signal

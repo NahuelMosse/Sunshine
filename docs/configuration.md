@@ -2092,6 +2092,48 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Runs a delay-based rate controller on each session, fed by what the client reports:
+            loss stats, the timestamp of its periodic ping and the arrival of each frame (Frame Stats).
+            With a client that does not send those, the session keeps the bitrate, FEC and pacing it
+            would have without the controller.
+            @note{Changing the bitrate during a session needs an encoder that supports it: NVENC on
+            GPUs that report dynamic bitrate change, and libx264. With other encoders the controller
+            encodes a share of the captured frames instead.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="4">Choices</td>
+        <td>disabled</td>
+        <td>The controller does not run.</td>
+    </tr>
+    <tr>
+        <td>shadow</td>
+        <td>The controller runs and logs the bitrate and FEC it would use, without changing anything.</td>
+    </tr>
+    <tr>
+        <td>fec</td>
+        <td>Like shadow, and it also sets the FEC percentage of every frame, overriding
+            [fec_percentage](#fec_percentage).</td>
+    </tr>
+    <tr>
+        <td>full</td>
+        <td>Like fec, and it also changes the encoder bitrate. It never goes above the bitrate the
+            client asked for.</td>
+    </tr>
+</table>
+
 ### qp
 
 <table>

@@ -25,6 +25,10 @@ namespace {
 
   using namespace NVENC_NAMESPACE;
 
+  // Frames between long-term reference marks: n slots in turn reach back n − 1 to n periods, so
+  // that a repair covering most of them still finds a slot marked before the loss.
+  constexpr uint64_t kLtrPeriod = 30;
+
   /**
    * @brief Determine whether an NVENC buffer format stores 10-bit samples.
    *
@@ -288,6 +292,13 @@ namespace NVENC_NAMESPACE {
     int requested_count,
     const GUID &encode_guid
   ) {
+    // With the adaptive bitrate controller repairing losses by invalidating references, the DPB has
+    // to reach back over the frames lost in a router's queue plus a round trip: a dozen frames when
+    // the path narrows. Sixteen is what H.264 and HEVC allow; AV1 keeps its eight.
+    const bool adaptive = config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    if (adaptive && default_count < 8) {
+      default_count = 16;
+    }
     ref_frames_option = requested_count > 0 ? static_cast<std::uint32_t>(requested_count) : default_count;
     if (ref_frames_option > 0U && !get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES)) {
       ref_frames_option = 1;
@@ -296,6 +307,34 @@ namespace NVENC_NAMESPACE {
     encoder_params.ref_frames_in_dpb = ref_frames_option;
     // Limit each frame to one reference while keeping a larger DPB for RFI fallback.
     list0_option = NV_ENC_NUM_REF_FRAMES_1;
+  }
+
+  // Behind another flow's queue —a movie downloading its next chunk fills a home router for a
+  // couple of seconds— a repair request arrives with more frames encoded since the loss than the
+  // DPB reaches back, and invalidating them all leaves nothing to predict from: an IDR frame,
+  // which is exactly what a full queue cannot carry. Long-term references, marked every
+  // kLtrPeriod frames in turn, keep a frame the client decoded before the loss within reach: with
+  // four, a repair that comes back more than a second late —behind a game download's eight
+  // connections the client could not get its request through for over one— still finds one, and
+  // twelve short-term references are left for the usual repair, of ten frames or so.
+  template<typename FormatConfig>
+  void nvenc_base::configure_long_term_references(FormatConfig &format_config, const GUID &encode_guid) {
+    encoder_params.ltr_frames = 0;
+    const bool adaptive = config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    // At most a quarter of the DPB: four of H.264's and HEVC's sixteen, two of AV1's eight
+    const auto slots = std::min({static_cast<int>(encoder_state.ltr.size()), get_encoder_cap(encode_guid, NV_ENC_CAPS_NUM_MAX_LTR_FRAMES), static_cast<int>(encoder_params.ref_frames_in_dpb / 4)});
+    if (!adaptive || !encoder_params.rfi || encoder_params.ref_frames_in_dpb < 8 || slots < 2) {
+      return;
+    }
+    // AV1 has them from SDK 13 on, frame by frame only and with no field to choose that mode
+    if constexpr (requires { format_config.enableLTR; format_config.ltrNumFrames; }) {
+      format_config.enableLTR = 1;
+      if constexpr (requires { format_config.ltrTrustMode; }) {
+        format_config.ltrTrustMode = 0;
+      }
+      format_config.ltrNumFrames = static_cast<uint32_t>(slots);
+      encoder_params.ltr_frames = static_cast<uint32_t>(slots);
+    }
   }
 
   template<typename FormatConfig>
@@ -370,6 +409,7 @@ namespace NVENC_NAMESPACE {
                                         NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC :
                                         NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
     configure_reference_frames(format_config.maxNumRefFrames, format_config.numRefL0, 5, client_config.numRefFrames, encode_guid);
+    configure_long_term_references(format_config, encode_guid);
 
     if (config.enable_min_qp) {
       enc_config.rcParams.enableMinQP = 1;
@@ -406,6 +446,7 @@ namespace NVENC_NAMESPACE {
 #endif
     }
     configure_reference_frames(format_config.maxNumRefFramesInDPB, format_config.numRefL0, 5, client_config.numRefFrames, encode_guid);
+    configure_long_term_references(format_config, encode_guid);
 
     if (config.enable_min_qp) {
       enc_config.rcParams.enableMinQP = 1;
@@ -447,6 +488,7 @@ namespace NVENC_NAMESPACE {
     format_config.colorRange = colorspace.full_range;
     format_config.chromaSamplePosition = buffer_is_yuv444(buffer_format) ? 0 : 1;
     configure_reference_frames(format_config.maxNumRefFramesInDPB, format_config.numFwdRefs, 8, client_config.numRefFrames, encode_guid);
+    configure_long_term_references(format_config, encode_guid);
 
     if (config.enable_min_qp) {
       enc_config.rcParams.enableMinQP = 1;
@@ -634,6 +676,7 @@ namespace NVENC_NAMESPACE {
       BOOST_LOG(error) << "NvEnc: encoding format is not supported by the gpu";
       return false;
     }
+    encoder_params.video_format = client_config.videoFormat;
     if (!validate_encoder_capabilities(init_params.encodeGUID, buffer_format)) {
       return false;
     }
@@ -675,6 +718,16 @@ namespace NVENC_NAMESPACE {
     BOOST_LOG(debug) << "NvEnc: requested encoded frame size "
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
     log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
+
+    // Keep a copy of the parameters for set_bitrate(): reconfiguring takes the whole set,
+    // not just the fields that change
+    reconfigure_state = {};
+    reconfigure_state.supported = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
+    reconfigure_state.enc_config = enc_config;
+    reconfigure_state.init_params = init_params;
+    reconfigure_state.init_params.encodeConfig = &reconfigure_state.enc_config;
+    reconfigure_state.initial_bitrate = enc_config.rcParams.averageBitRate;
+    reconfigure_state.initial_vbv = enc_config.rcParams.vbvBufferSize;
 
     encoder_state = {};
     fail_guard.disable();
@@ -749,6 +802,35 @@ namespace NVENC_NAMESPACE {
     pic_params.outputBitstream = output_bitstream;
     pic_params.completionEvent = async_event_handle;
 
+    if (encoder_params.ltr_frames > 0) {
+      auto long_term = [&](auto &codec_params) {
+        if constexpr (requires { codec_params.ltrMarkFrame; codec_params.ltrUseFrameBitmap; }) {
+          const int use = force_idr ? -1 : encoder_state.ltr_use;
+          if (use >= 0) {
+            codec_params.ltrUseFrames = 1;
+            codec_params.ltrUseFrameBitmap = 1U << use;
+          }
+          const auto slot = static_cast<int>((frame_index / kLtrPeriod) % encoder_params.ltr_frames);
+          if (frame_index % kLtrPeriod == 0 && slot != use) {
+            codec_params.ltrMarkFrame = 1;
+            codec_params.ltrMarkFrameIdx = static_cast<uint32_t>(slot);
+            encoder_state.ltr[slot] = {frame_index, true};
+          }
+        }
+      };
+      if (encoder_params.video_format == 0) {
+        long_term(pic_params.codecPicParams.h264PicParams);
+      } else if (encoder_params.video_format == 1) {
+        long_term(pic_params.codecPicParams.hevcPicParams);
+      }
+#if NVENC_SDK_VERSION >= 1200
+      else if (encoder_params.video_format == 2) {
+        long_term(pic_params.codecPicParams.av1PicParams);
+      }
+#endif
+      encoder_state.ltr_use = -1;
+    }
+
     if (nvenc_failed(nvenc->nvEncEncodePicture(encoder, &pic_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
       return {};
@@ -785,6 +867,12 @@ namespace NVENC_NAMESPACE {
 
     if (encoded_frame.idr) {
       BOOST_LOG(debug) << "NvEnc: idr frame " << encoded_frame.frame_index;
+      // An IDR frame empties the DPB, long-term references included
+      for (auto &slot : encoder_state.ltr) {
+        if (slot.frame_index != encoded_frame.frame_index) {
+          slot.valid = false;
+        }
+      }
     }
 
     if (nvenc_failed(nvenc->nvEncUnlockBitstream(encoder, lock_bitstream.outputBitstream))) {
@@ -794,6 +882,46 @@ namespace NVENC_NAMESPACE {
     encoder_state.frame_size_logger.collect_and_log(encoded_frame.data.size() / 1000.);
 
     return encoded_frame;
+  }
+
+  bool nvenc_base::set_bitrate(std::uint32_t kbps) {
+    if (!encoder || !reconfigure_state.supported || kbps == 0) {
+      return false;
+    }
+
+    auto &rc = reconfigure_state.enc_config.rcParams;
+    const std::uint32_t bitrate = kbps * 1000;
+    if (rc.averageBitRate == bitrate) {
+      return true;
+    }
+
+    rc.averageBitRate = bitrate;
+    if (rc.maxBitRate != 0) {
+      rc.maxBitRate = bitrate;
+    }
+    // The VBV was sized as a fraction of one frame at the initial bitrate; keep that
+    // fraction so the latency guarantee it provides does not change with the bitrate
+    if (reconfigure_state.initial_vbv != 0 && reconfigure_state.initial_bitrate != 0) {
+      rc.vbvBufferSize = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(reconfigure_state.initial_vbv) * bitrate / reconfigure_state.initial_bitrate
+      );
+      if (rc.vbvInitialDelay != 0) {
+        rc.vbvInitialDelay = rc.vbvBufferSize;
+      }
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS params = {NV_ENC_RECONFIGURE_PARAMS_VER};
+    params.reInitEncodeParams = reconfigure_state.init_params;
+    params.reInitEncodeParams.encodeConfig = &reconfigure_state.enc_config;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &params))) {
+      BOOST_LOG(warning) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    BOOST_LOG(debug) << "NvEnc: bitrate changed to " << kbps << " kbps";
+    return true;
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {
@@ -818,18 +946,46 @@ namespace NVENC_NAMESPACE {
 
     encoder_state.last_rfi_range = {first_frame, last_frame};
 
-    if (last_frame - first_frame + 1 >= encoder_params.ref_frames_in_dpb) {
+    // Within the DPB the lost frames are invalidated one by one. Beyond it, only the short-term
+    // references still in it —all of them after the loss— and the frame predicts from the newest
+    // long-term reference the client decoded before the loss.
+    const uint64_t short_term = encoder_params.ref_frames_in_dpb - encoder_params.ltr_frames;
+    const bool too_large = last_frame - first_frame + 1 >= short_term;
+    const uint64_t from = too_large ? last_frame + 1 - std::min(short_term, last_frame + 1) : first_frame;
+
+    // The client never decoded a long-term reference marked after the loss, so the encoder must
+    // not predict from it either
+    int ltr_slot = -1;
+    for (int i = 0; i < static_cast<int>(encoder_params.ltr_frames); i++) {
+      auto &slot = encoder_state.ltr[i];
+      if (slot.valid && slot.frame_index >= first_frame) {
+        slot.valid = false;
+        if (slot.frame_index < from && nvenc_failed(nvenc->nvEncInvalidateRefFrames(encoder, slot.frame_index))) {
+          BOOST_LOG(error) << "NvEnc: NvEncInvalidateRefFrames() " << slot.frame_index << " failed: " << last_nvenc_error_string;
+          return false;
+        }
+      }
+      if (slot.valid && (ltr_slot < 0 || slot.frame_index > encoder_state.ltr[ltr_slot].frame_index)) {
+        ltr_slot = i;
+      }
+    }
+
+    if (too_large && ltr_slot < 0) {
       BOOST_LOG(debug) << "NvEnc: rfi request too large, generating IDR";
       return false;
     }
 
-    for (auto i = first_frame; i <= last_frame; i++) {
+    for (auto i = from; i <= last_frame; i++) {
       if (nvenc_failed(nvenc->nvEncInvalidateRefFrames(encoder, i))) {
         BOOST_LOG(error) << "NvEnc: NvEncInvalidateRefFrames() " << i << " failed: " << last_nvenc_error_string;
         return false;
       }
     }
 
+    if (too_large) {
+      encoder_state.ltr_use = ltr_slot;
+      BOOST_LOG(debug) << "NvEnc: rfi request too large, predicting from long-term reference " << encoder_state.ltr[ltr_slot].frame_index;
+    }
     return true;
   }
 
