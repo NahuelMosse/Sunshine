@@ -288,6 +288,13 @@ namespace NVENC_NAMESPACE {
     int requested_count,
     const GUID &encode_guid
   ) {
+    // With the adaptive bitrate controller repairing losses by invalidating references, the DPB has
+    // to reach back over the frames lost in a router's queue plus a round trip: a dozen frames when
+    // the path narrows. Sixteen is what H.264 and HEVC allow; AV1 keeps its eight.
+    const bool adaptive = config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    if (adaptive && default_count < 8) {
+      default_count = 16;
+    }
     ref_frames_option = requested_count > 0 ? static_cast<std::uint32_t>(requested_count) : default_count;
     if (ref_frames_option > 0U && !get_encoder_cap(encode_guid, NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES)) {
       ref_frames_option = 1;
