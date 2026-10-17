@@ -2100,11 +2100,11 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td colspan="2">
             Runs a delay-based rate controller on each session, fed by what the client reports:
             loss stats, the timestamp of its periodic ping and the arrival of each frame (Frame Stats).
-            With a client that does not send those, the session keeps the bitrate and FEC it
+            With a client that does not send those, the session keeps the bitrate, FEC and pacing it
             would have without the controller.
             @note{Changing the bitrate during a session needs an encoder that supports it: NVENC on
-            GPUs that report dynamic bitrate change, and libx264. Other encoders keep the bitrate they are
-            opened with.}
+            GPUs that report dynamic bitrate change, and libx264. With other encoders the controller
+            encodes a share of the captured frames instead.}
         </td>
     </tr>
     <tr>

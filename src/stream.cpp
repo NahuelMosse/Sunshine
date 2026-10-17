@@ -531,6 +531,9 @@ namespace stream {
       std::string ping_payload;  ///< Payload expected from video-channel ping packets.
 
       int lowseq;  ///< Next base sequence number for video RTP packets.
+      // When this session's frames sent so far are paid for at its adaptive budget. Per session:
+      // the broadcast thread serves every session, and one session's budget must not hold another's frames.
+      std::chrono::steady_clock::time_point paid_until;  ///< When this session's frames sent so far are paid for at its budget.
       udp::endpoint peer;  ///< Client UDP endpoint for the video channel.
 
       std::optional<crypto::cipher::gcm_t> cipher;  ///< Optional AES-GCM cipher for encrypted video packets.
@@ -540,6 +543,7 @@ namespace stream {
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
       safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new target bitrate in kbps.
       safe::mail_raw_t::event_t<int> bitrate_fixed_events;  ///< Event saying the encoder keeps its bitrate, in kbps.
+      safe::mail_raw_t::event_t<int> frame_divider_events;  ///< Event carrying the share of captured frames to encode, in thousandths.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -1254,6 +1258,9 @@ namespace stream {
           BOOST_LOG(debug) << "IDR frame already on its way"sv;
           return;
         }
+        if (auto divider = session->adaptive->take_frame_divider()) {
+          session->video.frame_divider_events->raise(divider);
+        }
       }
 
       session->video.idr_events->raise(true);
@@ -1272,6 +1279,9 @@ namespace stream {
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
       if (session->adaptive) {
         session->adaptive->invalidation_requested(std::chrono::steady_clock::now());
+        if (auto divider = session->adaptive->take_frame_divider()) {
+          session->video.frame_divider_events->raise(divider);
+        }
       }
     });
 
@@ -1448,6 +1458,9 @@ namespace stream {
               }
               if (session->adaptive->enet_ping_due(now)) {
                 enet_peer_ping(session->control.peer);
+              }
+              if (auto divider = session->adaptive->take_frame_divider()) {
+                session->video.frame_divider_events->raise(divider);
               }
               adaptive_active = true;
               session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0);
@@ -1752,6 +1765,22 @@ namespace stream {
         // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
         size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
 
+        // The adaptive controller paces below that when its rate is lower
+        const double adaptive_pacing_bps = session->adaptive ? session->adaptive->pacing_bps() : 0.0;
+        const bool adaptive_paced = adaptive_pacing_bps > 0 && adaptive_pacing_bps < std::giga::num * 0.8;
+        std::chrono::nanoseconds ratecontrol_packet_time {};
+        if (adaptive_paced) {
+          ratecontrol_packet_time = std::chrono::nanoseconds(static_cast<std::int64_t>(blocksize * 8 * 1e9 / adaptive_pacing_bps));
+          ratecontrol_packets_in_1ms = std::max<std::int64_t>(1, std::chrono::nanoseconds(1ms) / ratecontrol_packet_time);
+        }
+        // How long after the start of the frame the given number of its packets is due
+        auto ratecontrol_offset = [&](size_t packets_sent) {
+          if (adaptive_paced) {
+            return ratecontrol_packet_time * packets_sent;
+          }
+          return std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) * packets_sent / ratecontrol_packets_in_1ms;
+        };
+
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
         // appear in "Other I/O" and begin waiting for interrupts.
@@ -1761,9 +1790,31 @@ namespace stream {
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
+        // And no more than a millisecond's worth at the adaptive pacing rate, or the pacing is lost
+        // inside the batch
+        if (adaptive_paced) {
+          send_batch_size = std::min(send_batch_size, ratecontrol_packets_in_1ms);
+        }
 
         // Don't ignore the last ratecontrol group of the previous frame
-        auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
+        const auto ratecontrol_now = std::chrono::steady_clock::now();
+        auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, ratecontrol_now);
+
+        // With the adaptive controller, a frame also waits until the previous ones are paid for
+        // at the budget. Frames the size of the budget never wait; larger ones —encoded for the
+        // budget before the last cut, or an encoder overshooting at a scene change— are held
+        // here instead of flooding the path's queue: that costs delay, a lost packet costs a key
+        // frame. Never more than a quarter of a second, so an encoder that keeps overshooting
+        // cannot pile up delay without end. And never for a frame already late: the queue from the
+        // encoder holds 32 frames and empties itself entirely when it fills, so holding every
+        // frame back while it grows loses half a second of video at once — and the client, seeing
+        // the gap, asks for a key frame. Past 120 ms since capture a frame goes out unheld, which
+        // keeps that queue to a handful of frames.
+        const double budget_bps = session->adaptive ? session->adaptive->budget_bps() : 0.0;
+        const bool late = packet->frame_timestamp && ratecontrol_now - *packet->frame_timestamp > 120ms;
+        if (budget_bps > 0 && !late) {
+          ratecontrol_frame_start = std::max(ratecontrol_frame_start, std::min(session->video.paid_until, ratecontrol_now + 250ms));
+        }
 
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
@@ -1882,9 +1933,7 @@ namespace stream {
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
               if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
-                auto due = ratecontrol_frame_start +
-                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                auto due = ratecontrol_frame_start + ratecontrol_offset(ratecontrol_frame_packets_sent);
 
                 auto now = std::chrono::steady_clock::now();
                 if (now < due) {
@@ -1932,9 +1981,7 @@ namespace stream {
           }
 
           // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          ratecontrol_next_frame_start = ratecontrol_frame_start + ratecontrol_offset(ratecontrol_frame_packets_sent);
 
           frame_network_latency_logger.second_point_now_and_log();
 
@@ -1955,6 +2002,11 @@ namespace stream {
 
         session->video.lowseq = lowseq;
 
+        // 10 % over the budget, so frames of the budget's size never wait on the ones before
+        if (budget_bps > 0) {
+          session->video.paid_until = ratecontrol_frame_start +
+                                      std::chrono::nanoseconds(static_cast<std::int64_t>(frame_wire_bytes * 8 * 1e9 / (1.1 * budget_bps)));
+        }
         if (session->adaptive && frame_first_send) {
           if (packet->frame_timestamp) {
             session->adaptive->host_delay(*frame_first_send - *packet->frame_timestamp);
@@ -2486,6 +2538,7 @@ namespace stream {
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.bitrate_events = mail->event<int>(mail::bitrate);
       session->video.bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
+      session->video.frame_divider_events = mail->event<int>(mail::frame_divider);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
