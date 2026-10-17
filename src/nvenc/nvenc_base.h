@@ -92,6 +92,14 @@ namespace NVENC_NAMESPACE {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
+    /**
+     * @brief Change the target bitrate with `nvEncReconfigureEncoder()`, keeping the encoder,
+     *        its reference frames and the VBV size in frames.
+     * @param kbps New target bitrate in kilobits per second.
+     * @return `true` on success, `false` if the GPU does not support dynamic bitrate or the call failed.
+     */
+    bool set_bitrate(std::uint32_t kbps) override;
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -222,16 +230,6 @@ namespace NVENC_NAMESPACE {
       const GUID &encode_guid
     );
 
-    /**
-     * @brief Configure VUI metadata and intra-refresh options shared by H.264 and HEVC.
-     *
-     * @tparam FormatConfig Codec-specific NVENC configuration type.
-     * @param format_config Codec-specific encoder configuration to update.
-     * @param client_config Stream configuration requested by the client.
-     * @param colorspace NVENC colorspace metadata.
-     * @param buffer_format Selected NVENC input format.
-     * @param encode_guid Selected codec GUID.
-     */
     template<typename FormatConfig>
     void configure_h264_hevc_metadata(
       FormatConfig &format_config,
@@ -345,6 +343,14 @@ namespace NVENC_NAMESPACE {
     ) const;
 
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
+
+    struct {
+      bool supported = false;  ///< GPU reports NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE.
+      NV_ENC_INITIALIZE_PARAMS init_params = {};  ///< Parameters the encoder was initialized with.
+      NV_ENC_CONFIG enc_config = {};  ///< Configuration `init_params.encodeConfig` points to.
+      std::uint32_t initial_bitrate = 0;  ///< Bitrate at initialization, in bits per second.
+      std::uint32_t initial_vbv = 0;  ///< VBV buffer size at initialization, in bits.
+    } reconfigure_state;  ///< What `set_bitrate()` needs to rebuild the parameters.
 
     struct {
       uint64_t last_encoded_frame_index = 0;

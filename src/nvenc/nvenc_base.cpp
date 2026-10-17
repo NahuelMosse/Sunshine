@@ -676,6 +676,16 @@ namespace NVENC_NAMESPACE {
                      << frame_size_format % (client_config.bitrate / 8. / client_config.framerate) << " kB";
     log_created_encoder(init_params, enc_config, config, client_config, buffer_format);
 
+    // Keep a copy of the parameters for set_bitrate(): reconfiguring takes the whole set,
+    // not just the fields that change
+    reconfigure_state = {};
+    reconfigure_state.supported = get_encoder_cap(init_params.encodeGUID, NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE);
+    reconfigure_state.enc_config = enc_config;
+    reconfigure_state.init_params = init_params;
+    reconfigure_state.init_params.encodeConfig = &reconfigure_state.enc_config;
+    reconfigure_state.initial_bitrate = enc_config.rcParams.averageBitRate;
+    reconfigure_state.initial_vbv = enc_config.rcParams.vbvBufferSize;
+
     encoder_state = {};
     fail_guard.disable();
     return true;
@@ -794,6 +804,46 @@ namespace NVENC_NAMESPACE {
     encoder_state.frame_size_logger.collect_and_log(encoded_frame.data.size() / 1000.);
 
     return encoded_frame;
+  }
+
+  bool nvenc_base::set_bitrate(std::uint32_t kbps) {
+    if (!encoder || !reconfigure_state.supported || kbps == 0) {
+      return false;
+    }
+
+    auto &rc = reconfigure_state.enc_config.rcParams;
+    const std::uint32_t bitrate = kbps * 1000;
+    if (rc.averageBitRate == bitrate) {
+      return true;
+    }
+
+    rc.averageBitRate = bitrate;
+    if (rc.maxBitRate != 0) {
+      rc.maxBitRate = bitrate;
+    }
+    // The VBV was sized as a fraction of one frame at the initial bitrate; keep that
+    // fraction so the latency guarantee it provides does not change with the bitrate
+    if (reconfigure_state.initial_vbv != 0 && reconfigure_state.initial_bitrate != 0) {
+      rc.vbvBufferSize = static_cast<std::uint32_t>(
+        static_cast<std::uint64_t>(reconfigure_state.initial_vbv) * bitrate / reconfigure_state.initial_bitrate
+      );
+      if (rc.vbvInitialDelay != 0) {
+        rc.vbvInitialDelay = rc.vbvBufferSize;
+      }
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS params = {NV_ENC_RECONFIGURE_PARAMS_VER};
+    params.reInitEncodeParams = reconfigure_state.init_params;
+    params.reInitEncodeParams.encodeConfig = &reconfigure_state.enc_config;
+    params.resetEncoder = 0;
+    params.forceIDR = 0;
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &params))) {
+      BOOST_LOG(warning) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    BOOST_LOG(debug) << "NvEnc: bitrate changed to " << kbps << " kbps";
+    return true;
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {
