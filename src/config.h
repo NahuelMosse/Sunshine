@@ -272,6 +272,8 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link
     int packetsize;  ///< Maximum payload size for network packets.
+
+    std::string adaptive_bitrate;  ///< Adaptive bitrate controller mode: disabled, shadow, fec or full.
   };
 
   /**
