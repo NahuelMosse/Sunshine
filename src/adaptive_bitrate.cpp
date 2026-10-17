@@ -48,27 +48,27 @@ namespace adaptive_bitrate {
 
     // The controller's tuning table, with the facts of this session filled in. Everything
     // else keeps the values the test bench validated.
-    estab::Parametros make_params(int bitrate_kbps, int framerate, int payload, int wire, double audio_bps, int min_parity) {
-      estab::Parametros p;
-      p.fec_minimo_paquetes = std::max(0, min_parity);
+    abr::Params make_params(int bitrate_kbps, int framerate, int payload, int wire, double audio_bps, int min_parity) {
+      abr::Params p;
+      p.fec_min_packets = std::max(0, min_parity);
       // The variant the bench validated with the GameStream signals. Without per-frame arrival
       // times there is no dispersion to measure, so what remains is the delay law with its
       // ceilings and the jumps on loss.
-      p.variante = estab::Variante::tren;
+      p.variant = abr::Variant::train;
       p.bitrate_max = bitrate_kbps * 1000.0;
       p.fps = framerate;
       p.mtu = payload;
-      p.cabeceras = wire - payload;
+      p.header_bytes = wire - payload;
       p.audio_bps = audio_bps;
 
-      // Tuning experiments: SUNSHINE_ESTAB_PARAMS="tren_destino=0.95 salto_rapido=0.4"
+      // Tuning experiments: SUNSHINE_ESTAB_PARAMS="train_utilization=0.95 fast_backoff=0.4"
       // overrides the bench-validated values for this process, and says so in the log.
       if (const char *extra = std::getenv("SUNSHINE_ESTAB_PARAMS")) {
         std::istringstream in {extra};
         std::string kv;
         while (in >> kv) {
           const auto eq = kv.find('=');
-          if (eq != std::string::npos && p.fijar(kv.substr(0, eq), kv.substr(eq + 1))) {
+          if (eq != std::string::npos && p.set(kv.substr(0, eq), kv.substr(eq + 1))) {
             BOOST_LOG(warning) << "Adaptive bitrate: parameter override "sv << kv;
           } else {
             BOOST_LOG(warning) << "Adaptive bitrate: ignoring unknown parameter override "sv << kv;
@@ -100,50 +100,61 @@ namespace adaptive_bitrate {
       wire_per_packet {std::max(1, packetsize) + std::max(0, wire_overhead)},
       params {make_params(bitrate_kbps, this->framerate, payload_per_packet, wire_per_packet, audio_bps, min_parity)},
       control {params} {
-    control.reiniciar(params.bitrate_max);
+    control.reset(params.bitrate_max);
     meter.audio(audio_bps);
-    meter.configurar(params);
+    meter.configure(params);
 
+    const double start_bps = params.bitrate_max * params.startup_fraction;
+    const double image_bps = start_bps * payload_per_packet / wire_per_packet - audio_bps;
+    initial_kbps = std::max(500, static_cast<int>(image_bps / 1000.0));
+  }
+
+  void session_t::activate() {
+    if (active_signals.exchange(true, std::memory_order_relaxed)) {
+      return;
+    }
     // Until the first step the stream runs on what the controller starts from, not on what
     // the client asked for: the encoder on the image part of the starting budget, and the
     // pacing on its multiple. Otherwise the first frames go out at the client's bitrate and at
     // line rate, and against a path someone else already fills that is a broken first second.
-    const double start_bps = params.bitrate_max * params.arranque_fraccion;
-    const double image_bps = start_bps * payload_per_packet / wire_per_packet - audio_bps;
-    initial_kbps = std::max(500, static_cast<int>(image_bps / 1000.0));
-    if (mode == mode_e::full && params.tren_pacing > 0) {
-      pacing.store(params.tren_pacing * start_bps, std::memory_order_relaxed);
+    const double start_bps = params.bitrate_max * params.startup_fraction;
+    if (mode == mode_e::full) {
+      target_kbps.store(initial_kbps, std::memory_order_relaxed);
+      if (params.train_pacing > 0) {
+        pacing.store(params.train_pacing * start_bps, std::memory_order_relaxed);
+      }
     }
     budget.store(start_bps, std::memory_order_relaxed);
+    BOOST_LOG(info) << "Adaptive bitrate: the client reports its signals, the controller takes over"sv;
   }
 
   void session_t::frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes) {
-    estab::gamestream::CuadroEnviado frame;
-    frame.indice = frame_index;
-    frame.t_primero_us = to_us(first);
-    frame.t_ultimo_us = to_us(last);
-    frame.paquetes = packets;
-    frame.paquetes_datos = data_packets;
-    frame.bytes_rtp = rtp_bytes;
-    frame.bytes_cable = wire_bytes;
+    abr::gamestream::SentFrame frame;
+    frame.index = frame_index;
+    frame.t_first_us = to_us(first);
+    frame.t_last_us = to_us(last);
+    frame.packets = packets;
+    frame.data_packets = data_packets;
+    frame.rtp_bytes = rtp_bytes;
+    frame.wire_bytes = wire_bytes;
 
     std::lock_guard lg {lock};
-    meter.enviado(frame);
+    meter.sent(frame);
     last_frame_index = frame_index;
 
     // ESTAB_METRICAS: métrica temporal del sandbox, se saca antes del PR. Cuándo salió cada
     // cuadro, en el reloj monotónico que el cliente del mismo kernel comparte.
     static const bool metricas = std::getenv("ESTAB_METRICAS") && *std::getenv("ESTAB_METRICAS");
     if (metricas) {
-      BOOST_LOG(info) << "ESTAB enviado indice="sv << frame_index << " t0="sv << frame.t_primero_us
-                      << " t1="sv << frame.t_ultimo_us << " paquetes="sv << packets << " datos="sv << data_packets
+      BOOST_LOG(info) << "ESTAB enviado indice="sv << frame_index << " t0="sv << frame.t_first_us
+                      << " t1="sv << frame.t_last_us << " paquetes="sv << packets << " datos="sv << data_packets
                       << " bytes="sv << static_cast<long long>(wire_bytes) << " pedido="sv << target_kbps.load(std::memory_order_relaxed)
                       << " espera="sv << std::lround(host_delay_s.load(std::memory_order_relaxed) * 1000.0);
     }
   }
 
   bool session_t::idr_requested(std::chrono::steady_clock::time_point now) {
-    if (mode != mode_e::fec && mode != mode_e::full) {
+    if ((mode != mode_e::fec && mode != mode_e::full) || !active()) {
       return true;
     }
     std::lock_guard lg {lock};
@@ -157,7 +168,7 @@ namespace adaptive_bitrate {
       return false;
     }
     last_idr_at = now;
-    meter.pedido_idr(last_frame_index + 1);
+    meter.idr_request(last_frame_index + 1);
     // And at the plain frame rate: one frame in several, each paid for several times over, made
     // the IDR frame that many times larger
     if (divider > 1) {
@@ -176,16 +187,16 @@ namespace adaptive_bitrate {
     // receivedDataPackets, receivedParityPackets, fecPercentage, multiFecBlockIndex,
     // multiFecBlockCount
     auto data = reinterpret_cast<const unsigned char *>(payload.data());
-    estab::gamestream::EstadoFec status;
-    status.indice = be32(data);
-    status.faltantes = be16(data + 8);
-    status.datos_total = be16(data + 10);
-    status.paridad_total = be16(data + 12);
-    status.datos_recibidos = be16(data + 14);
-    status.paridad_recibida = be16(data + 16);
+    abr::gamestream::FecStatus status;
+    status.index = be32(data);
+    status.missing = be16(data + 8);
+    status.data_total = be16(data + 10);
+    status.parity_total = be16(data + 12);
+    status.data_received = be16(data + 14);
+    status.parity_received = be16(data + 16);
 
     std::lock_guard lg {lock};
-    meter.estado_fec(status);
+    meter.fec_status(status);
     return true;
   }
 
@@ -201,14 +212,15 @@ namespace adaptive_bitrate {
     std::lock_guard lg {lock};
     for (std::size_t i = 0; i < count; ++i) {
       const unsigned char *e = data + frame_stats_header + i * frame_stats_entry;
-      estab::gamestream::TrenRecibido arrival;
-      arrival.indice = be32(e);
-      arrival.t_primero_us = be32(e + 4);
-      arrival.t_ultimo_us = be32(e + 8);
+      abr::gamestream::ReceivedTrain arrival;
+      arrival.index = be32(e);
+      arrival.t_first_us = be32(e + 4);
+      arrival.t_last_us = be32(e + 8);
       arrival.bytes = be32(e + 12);
-      arrival.paquetes = be16(e + 16);
-      meter.tren(arrival);
+      arrival.packets = be16(e + 16);
+      meter.train(arrival);
     }
+    activate();
     return true;
   }
 
@@ -218,37 +230,45 @@ namespace adaptive_bitrate {
     }
     // lossCountSinceLastReport, reportInterval, a constant 1000, lastGoodFrame (64 bits)
     auto data = reinterpret_cast<const unsigned char *>(payload.data());
-    estab::gamestream::ResumenPerdida stats;
-    stats.perdidos = le32(data);
-    stats.ultimo_bueno = le32(data + 12);
+    abr::gamestream::LossSummary stats;
+    stats.lost = le32(data);
+    stats.last_good = le32(data + 12);
 
     std::lock_guard lg {lock};
-    meter.resumen(to_us(now), stats);
-    frames_lost += stats.perdidos;
+    meter.summary(to_us(now), stats);
+    frames_lost += stats.lost;
+    activate();
     return true;
   }
 
   bool session_t::client_ping(std::chrono::steady_clock::time_point now, std::string_view payload) {
-    // A 16-bit length and the client's monotonic clock in milliseconds, little-endian
+    // A length of 4 and the client's monotonic clock in milliseconds, little-endian. Moonlight
+    // writes the length in 32 bits, and in 16 bits before moonlight-common-c e2722dc.
     if (payload.size() < 6) {
       return false;
     }
+    const auto *p = reinterpret_cast<const unsigned char *>(payload.data());
+    const std::size_t at = payload.size() >= 8 && le32(p) == 4 ? 4 : 2;
+    const std::uint32_t client_ms = le32(p + at);
     std::lock_guard lg {lock};
-    meter.ping_cliente(to_us(now), le32(reinterpret_cast<const unsigned char *>(payload.data()) + 2));
+    meter.client_ping(to_us(now), client_ms);
+    if (client_ms != 0) {
+      activate();
+    }
     return true;
   }
 
   void session_t::enet_sample(std::chrono::steady_clock::time_point now, double sample_ms) {
-    if (mode == mode_e::disabled || sample_ms <= 0) {
+    if (mode == mode_e::disabled || !active() || sample_ms <= 0) {
       return;
     }
     last_rtt_s = sample_ms / 1000.0;
     // The frames in flight, within what the encoder can still predict from (take_frame_divider).
     // Up at once, down only once the round trip has stayed short for half a second.
-    if ((params.cuadros_en_vuelo > 0 || divider > 1) && (mode == mode_e::fec || mode == mode_e::full)) {
+    if ((params.frames_in_flight > 0 || divider > 1) && (mode == mode_e::fec || mode == mode_e::full)) {
       // The round trip and the time frames wait in the host before leaving (host_delay)
       const double in_flight_s = sample_ms / 1000.0 + host_delay_s.load(std::memory_order_relaxed);
-      const int wanted = params.cuadros_en_vuelo > 0 ? std::clamp(static_cast<int>(std::ceil(in_flight_s * framerate / params.cuadros_en_vuelo)), 1, 4) : 1;
+      const int wanted = params.frames_in_flight > 0 ? std::clamp(static_cast<int>(std::ceil(in_flight_s * framerate / params.frames_in_flight)), 1, 4) : 1;
       if (wanted >= divider) {
         divider_raised_at = now;
       }
@@ -265,7 +285,7 @@ namespace adaptive_bitrate {
     bool undone = false;
     {
       std::lock_guard lg {lock};
-      if (!meter.muestra_enet(to_us(now), sample_ms, queue_seen, growth)) {
+      if (!meter.enet_sample(to_us(now), sample_ms, queue_seen, growth)) {
         return;
       }
       // ESTAB_METRICAS: métrica temporal del sandbox, se saca antes del PR
@@ -278,31 +298,31 @@ namespace adaptive_bitrate {
       // The sample right after an alarm may show the queue back at its floor: then the step was a
       // delayed acknowledgement, not a narrower path, and everything the alarm changed goes back
       if (have_measurement && (mode == mode_e::fec || mode == mode_e::full) &&
-          control.desmentir_alarma(to_us(now) / 1e6, queue_seen)) {
+          control.retract_alarm(to_us(now) / 1e6, queue_seen)) {
         undone = true;
-        now_budget = control.presupuesto();
-        min_parity_now.store(control.paridad_minima(), std::memory_order_relaxed);
+        now_budget = control.budget();
+        min_parity_now.store(control.min_parity(), std::memory_order_relaxed);
         if (divider != divider_before_alarm) {
           divider = divider_before_alarm;
           publish_frames();
         }
       } else if (have_measurement && (mode == mode_e::fec || mode == mode_e::full) &&
-                 control.alarma(to_us(now) / 1e6, queue_seen, growth, last_measurement.tasa_recibida)) {
+                 control.alarm(to_us(now) / 1e6, queue_seen, growth, last_measurement.received_rate)) {
         cut = true;
         divider_before_alarm = divider;
-        now_budget = control.presupuesto();
-        min_parity_now.store(control.paridad_minima(), std::memory_order_relaxed);
+        now_budget = control.budget();
+        min_parity_now.store(control.min_parity(), std::memory_order_relaxed);
         // What the queue that overflowed holds will be missed a whole queue later, when the first
         // good frame behind it arrives: fewer frames until then keep that loss repairable
-        if (params.cuadros_alarma > divider) {
-          divider = params.cuadros_alarma;
+        if (params.alarm_frame_divisor > divider) {
+          divider = params.alarm_frame_divisor;
           publish_frames();
         }
-        if (params.cuadros_alarma > 1) {
+        if (params.alarm_frame_divisor > 1) {
           divider_raised_at = now + std::chrono::milliseconds(100);
         }
-        if (control.alarma_pide_cuadro_clave()) {
-          meter.pedido_idr(last_frame_index + 1);
+        if (control.alarm_requests_keyframe()) {
+          meter.idr_request(last_frame_index + 1);
           idr_wanted.store(true, std::memory_order_relaxed);
         }
       }
@@ -312,8 +332,8 @@ namespace adaptive_bitrate {
     }
     const double before = budget.load(std::memory_order_relaxed);
     budget.store(now_budget, std::memory_order_relaxed);
-    if (params.tren_pacing > 0) {
-      pacing.store(params.tren_pacing * now_budget, std::memory_order_relaxed);
+    if (params.train_pacing > 0) {
+      pacing.store(params.train_pacing * now_budget, std::memory_order_relaxed);
     }
     if (before > 0) {
       target_kbps.store(static_cast<int>(target_kbps.load(std::memory_order_relaxed) * now_budget / before), std::memory_order_relaxed);
@@ -325,29 +345,29 @@ namespace adaptive_bitrate {
   }
 
   void session_t::invalidation_requested(std::chrono::steady_clock::time_point now) {
-    if (mode != mode_e::fec && mode != mode_e::full) {
+    if ((mode != mode_e::fec && mode != mode_e::full) || !active()) {
       return;
     }
     {
       // Until the frame with the invalidated references arrives the client drops whole frames and
       // counts them lost, exactly as while it waits for an IDR frame: that is not loss in the path
       std::lock_guard lg {lock};
-      meter.pedido_idr(last_frame_index + 1);
+      meter.idr_request(last_frame_index + 1);
     }
     // A frame lost on a path without a queue leaves nothing to drain, and frames four times larger
     // would build one: the divider is for a loss behind a queue
-    if (params.cuadros_alarma <= 1 || queue.load(std::memory_order_relaxed) < params.alarma_fila) {
+    if (params.alarm_frame_divisor <= 1 || queue.load(std::memory_order_relaxed) < params.alarm_queue) {
       return;
     }
-    if (params.cuadros_alarma > divider) {
-      divider = params.cuadros_alarma;
+    if (params.alarm_frame_divisor > divider) {
+      divider = params.alarm_frame_divisor;
       publish_frames();
     }
     divider_raised_at = now + std::chrono::milliseconds(100);
   }
 
   bool session_t::enet_ping_due(std::chrono::steady_clock::time_point now) {
-    if (mode == mode_e::disabled || now < next_enet_ping) {
+    if (mode == mode_e::disabled || !active() || now < next_enet_ping) {
       return false;
     }
     next_enet_ping = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(params.enet_ping_ms / 1000.0));
@@ -355,7 +375,7 @@ namespace adaptive_bitrate {
   }
 
   void session_t::tick(std::chrono::steady_clock::time_point now, double rtt_s, double rtt_sample_s) {
-    if (mode == mode_e::disabled || now < next_step) {
+    if (mode == mode_e::disabled || !active() || now < next_step) {
       return;
     }
     const auto cycle = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(params.Tc));
@@ -370,32 +390,32 @@ namespace adaptive_bitrate {
     }
     last_tick = now;
 
-    estab::Decision decision;
+    abr::Decision decision;
     std::uint64_t lost_so_far;
     {
       std::lock_guard lg {lock};
       lost_so_far = frames_lost;
-      meter.rtt(params.enet_rtt_crudo && rtt_sample_s > 0 ? rtt_sample_s : rtt_s);
-      estab::Medicion measurement;
-      if (meter.medicion(to_us(now), measurement)) {
+      meter.rtt(params.enet_rtt_raw && rtt_sample_s > 0 ? rtt_sample_s : rtt_s);
+      abr::Measurement measurement;
+      if (meter.measure(to_us(now), measurement)) {
         last_measurement = measurement;
         have_measurement = true;
       }
       if (!have_measurement || now < hold_until) {
         return;
       }
-      control.cuadros_por_segundo(framerate * frames_kept());
-      decision = control.paso(last_measurement);
+      control.set_fps(framerate * frames_kept());
+      decision = control.step(last_measurement);
     }
 
     // What the encoder is asked for: the image budget, scaled up by what the encoder has been
     // falling short of it
-    target_kbps.store(static_cast<int>(decision.pedido_codificador / 1000.0), std::memory_order_relaxed);
-    target_fec.store(static_cast<int>(std::lround(decision.reparacion * 100.0)), std::memory_order_relaxed);
-    if (params.tren_pacing > 0) {
-      pacing.store(params.tren_pacing * decision.presupuesto, std::memory_order_relaxed);
+    target_kbps.store(static_cast<int>(decision.encoder_request / 1000.0), std::memory_order_relaxed);
+    target_fec.store(static_cast<int>(std::lround(decision.repair * 100.0)), std::memory_order_relaxed);
+    if (params.train_pacing > 0) {
+      pacing.store(params.train_pacing * decision.budget, std::memory_order_relaxed);
     }
-    budget.store(decision.presupuesto, std::memory_order_relaxed);
+    budget.store(decision.budget, std::memory_order_relaxed);
     // An encoder that keeps its bitrate gets the budget as the share of the frames it encodes, by
     // what it sends with every frame, learnt as an average: not by its nominal bitrate —encoders
     // fall short of it, libx264 by a third, and the image stayed at half the budget—, and not by
@@ -403,12 +423,12 @@ namespace adaptive_bitrate {
     // tenths of the budget, the controller reads that as an encoder with nothing to send and stops
     // raising the budget. Fewer frames at once; more, smoothly over a second
     if (fixed_kbps > 0 && mode == mode_e::full) {
-      const double data_kbps = last_measurement.tasa_datos / 1000.0;
+      const double data_kbps = last_measurement.data_rate / 1000.0;
       if (data_kbps > 0) {
         const double full = data_kbps / frames_kept();
         full_kbps = full_kbps > 0 ? full_kbps + 0.1 * (full - full_kbps) : full;
       }
-      const double image_kbps = decision.imagen / 1000.0;
+      const double image_kbps = decision.video_rate / 1000.0;
       const double wanted = std::clamp(image_kbps / std::max(1.0, full_kbps > 0 ? full_kbps : fixed_kbps), 1.0 / kMaxRateDivider, 1.0);
       const double previous = rate_keep;
       rate_keep = wanted < rate_keep ? wanted : rate_keep + 0.1 * (wanted - rate_keep);
@@ -419,44 +439,44 @@ namespace adaptive_bitrate {
     {
       std::lock_guard lg {fec_lock};
       have_decision = true;
-      loss_estimate = decision.perdida_est;
-      burst_estimate = decision.rafaga_perdida;
+      loss_estimate = decision.loss_est;
+      burst_estimate = decision.loss_burst;
     }
-    min_parity_now.store(decision.paridad_minima, std::memory_order_relaxed);
+    min_parity_now.store(decision.min_parity, std::memory_order_relaxed);
 
     // One line per controller step, in a fixed key=value layout so a session can be analysed
     // afterwards: rates in kbps, times in ms, fractions in percent.
-    BOOST_LOG(debug) << "Adaptive bitrate step: budget="sv << static_cast<int>(decision.presupuesto / 1000.0)
-                     << " image="sv << static_cast<int>(decision.imagen / 1000.0)
-                     << " encoder="sv << static_cast<int>(decision.pedido_codificador / 1000.0)
-                     << " data="sv << static_cast<int>(last_measurement.tasa_datos / 1000.0)
-                     << " fec="sv << std::lround(decision.reparacion * 100.0)
-                     << " fec_sent="sv << std::lround(last_measurement.paridad_emitida * 100.0)
-                     << " queue="sv << std::lround(decision.fila * 1000.0)
+    BOOST_LOG(debug) << "Adaptive bitrate step: budget="sv << static_cast<int>(decision.budget / 1000.0)
+                     << " image="sv << static_cast<int>(decision.video_rate / 1000.0)
+                     << " encoder="sv << static_cast<int>(decision.encoder_request / 1000.0)
+                     << " data="sv << static_cast<int>(last_measurement.data_rate / 1000.0)
+                     << " fec="sv << std::lround(decision.repair * 100.0)
+                     << " fec_sent="sv << std::lround(last_measurement.parity_sent * 100.0)
+                     << " queue="sv << std::lround(decision.queue * 1000.0)
                      << " target_queue="sv << std::lround(decision.dref * 1000.0)
                      << " capacity="sv << static_cast<int>(decision.C_est / 1000.0)
-                     << " train="sv << static_cast<int>(decision.ancho_tren / 1000.0)
-                     << " received="sv << static_cast<int>(last_measurement.tasa_recibida / 1000.0)
-                     << " sent="sv << static_cast<int>(last_measurement.tasa_emitida / 1000.0)
-                     << " loss="sv << std::lround(last_measurement.perdida * 1000.0) / 10.0
-                     << " burst="sv << decision.rafaga_perdida
+                     << " train="sv << static_cast<int>(decision.train_bandwidth / 1000.0)
+                     << " received="sv << static_cast<int>(last_measurement.received_rate / 1000.0)
+                     << " sent="sv << static_cast<int>(last_measurement.sent_rate / 1000.0)
+                     << " loss="sv << std::lround(last_measurement.loss * 1000.0) / 10.0
+                     << " burst="sv << decision.loss_burst
                      << " rtt="sv << std::lround(last_measurement.rtt * 1000.0)
-                     << " late="sv << last_measurement.reportes_tardios
+                     << " late="sv << last_measurement.late_reports
                      << " frames_lost="sv << lost_so_far
-                     << " reason="sv << estab::nombre(decision.motivo);
+                     << " reason="sv << abr::name(decision.reason);
 
     if (now >= next_log) {
       next_log = now + 2s;
       const auto mode_name = mode == mode_e::shadow ? "shadow"sv : mode == mode_e::fec ? "fec"sv : "full"sv;
       BOOST_LOG(info) << "Adaptive bitrate ["sv << mode_name << "]: budget "sv
-                      << static_cast<int>(decision.presupuesto / 1000.0) << " of "sv << configured_kbps
-                      << " kbps, encoder "sv << static_cast<int>(decision.imagen / 1000.0)
-                      << " kbps, FEC "sv << std::lround(decision.reparacion * 100.0)
+                      << static_cast<int>(decision.budget / 1000.0) << " of "sv << configured_kbps
+                      << " kbps, encoder "sv << static_cast<int>(decision.video_rate / 1000.0)
+                      << " kbps, FEC "sv << std::lround(decision.repair * 100.0)
                       << "%, measured capacity "sv << static_cast<int>(decision.C_est / 1000.0)
-                      << " kbps, queue "sv << static_cast<int>(decision.fila * 1000.0)
-                      << " ms, loss "sv << std::lround(last_measurement.perdida * 1000.0) / 10.0
-                      << "%, received "sv << static_cast<int>(last_measurement.tasa_recibida / 1000.0)
-                      << " kbps ("sv << estab::nombre(decision.motivo) << ')';
+                      << " kbps, queue "sv << static_cast<int>(decision.queue * 1000.0)
+                      << " ms, loss "sv << std::lround(last_measurement.loss * 1000.0) / 10.0
+                      << "%, received "sv << static_cast<int>(last_measurement.received_rate / 1000.0)
+                      << " kbps ("sv << abr::name(decision.reason) << ')';
     }
   }
 
@@ -488,7 +508,7 @@ namespace adaptive_bitrate {
   }
 
   int session_t::fec_percentage(int configured) const {
-    if (mode != mode_e::fec && mode != mode_e::full) {
+    if ((mode != mode_e::fec && mode != mode_e::full) || !active()) {
       return configured;
     }
     const int fec = target_fec.load(std::memory_order_relaxed);
@@ -496,15 +516,15 @@ namespace adaptive_bitrate {
   }
 
   int session_t::block_fec_percentage(int data_shards, bool repairs) {
-    if ((mode != mode_e::fec && mode != mode_e::full) || data_shards <= 0) {
+    if ((mode != mode_e::fec && mode != mode_e::full) || !active() || data_shards <= 0) {
       return -1;
     }
     std::lock_guard lg {fec_lock};
     // Before the first decision nothing has been measured, and the first frames go out on a
     // budget nobody verified: protect them as the controller does for its first seconds
-    const double loss = have_decision ? loss_estimate : params.paridad_arranque;
+    const double loss = have_decision ? loss_estimate : params.parity_startup;
     const double burst = have_decision ? burst_estimate : 1.0;
-    if (!have_decision && !params.paridad_en_paquetes) {
+    if (!have_decision && !params.parity_in_packets) {
       return -1;
     }
     int min_parity = have_decision ? min_parity_now.load(std::memory_order_relaxed) : -1;
@@ -515,14 +535,14 @@ namespace adaptive_bitrate {
     // a far stricter failure target, on the loss measured: making up for a client that does not
     // report loss, with a floor here and each request counted as loss, overflowed a path that had
     // just narrowed and fed the very cascade it was meant to stop.
-    estab::Parametros block_params = params;
+    abr::Params block_params = params;
     if (repairs) {
-      block_params.paridad_falla_bloque = params.paridad_falla_reparacion;
-      block_params.fec_max = std::max(params.fec_max, params.fec_max_reparacion);
-      min_parity = std::max(min_parity, params.fec_minimo_paquetes);
+      block_params.parity_block_failure = params.parity_repair_failure;
+      block_params.fec_max = std::max(params.fec_max, params.fec_max_repair);
+      min_parity = std::max(min_parity, params.fec_min_packets);
     }
-    int parity = params.paridad_en_paquetes ?
-                   estab::paridad_de_bloque(data_shards, loss, burst, block_params, min_parity) :
+    int parity = params.parity_in_packets ?
+                   abr::block_parity(data_shards, loss, burst, block_params, min_parity) :
                    static_cast<int>(std::ceil(data_shards * target_fec.load(std::memory_order_relaxed) / 100.0));
     parity = std::clamp(parity, 1, 255 - data_shards);
     // fec::encode rounds data_shards * percentage / 100 up, so this is the smallest percentage

@@ -2001,12 +2001,13 @@ editing the `conf` file in a text editor. Use the examples as reference.
     <tr>
         <td>Description</td>
         <td colspan="2">
-            Runs a delay-based rate controller on each session, fed by per-frame arrival reports
-            from the client. It needs a client that sends frame train reports; with other clients it
-            stays off.
+            Runs a delay-based rate controller on each session, fed by what the client reports:
+            loss stats, the timestamp of its periodic ping and the arrival of each frame (Frame Stats).
+            With a client that does not send those, the session keeps the bitrate, FEC and pacing it
+            would have without the controller.
             @note{Changing the bitrate during a session needs an encoder that supports it: NVENC on
-            GPUs that report dynamic bitrate change, and libx264. Other encoders keep the bitrate the
-            client asked for.}
+            GPUs that report dynamic bitrate change, and libx264. With other encoders the controller
+            encodes a share of the captured frames instead.}
         </td>
     </tr>
     <tr>

@@ -2,7 +2,7 @@
  * @file src/adaptive_bitrate.h
  * @brief Declarations for the per-session adaptive bitrate controller.
  *
- * The controller itself lives in src/estab and is shared verbatim with the test bench that
+ * The controller itself lives in src/abr and is shared verbatim with the test bench that
  * validates it. This file only adapts Sunshine to it: it records what each frame looked like
  * when it left the host, feeds in what the client already reports over GameStream (the
  * per-frame FEC status and the periodic loss stats) together with the round trip ENet
@@ -22,8 +22,8 @@
 #include <string_view>
 
 // local includes
-#include "estab/control.h"
-#include "estab/gamestream/senales.h"
+#include "abr/control.h"
+#include "abr/gamestream/signals.h"
 
 namespace adaptive_bitrate {
 
@@ -125,7 +125,7 @@ namespace adaptive_bitrate {
      * @brief Feed the last round trip ENet measured, as soon as it is read.
      *
      * Between two controller steps, a step in the queue that only a narrower path explains cuts
-     * the budget right away (estab::Control::alarma): a path that narrows threefold overflows a
+     * the budget right away (abr::Control::alarm): a path that narrows threefold overflows a
      * quarter-second router buffer in about 150 ms, sooner than the next step.
      *
      * @param now Current time.
@@ -157,7 +157,7 @@ namespace adaptive_bitrate {
      * later counting the queue. To repair the loss by invalidating references, the last frame it
      * has must still be among the encoder's references —sixteen at most in H.264 and HEVC—, and
      * behind a router queue of a quarter of a second sixty frames per second push it out. So the
-     * frames in flight, the round trip times the frame rate, are kept within `cuadros_en_vuelo`:
+     * frames in flight, the round trip times the frame rate, are kept within `frames_in_flight`:
      * with a long queue fewer frames are encoded, and the client sees a lower frame rate, as it
      * does whenever the screen is still. And with an encoder that keeps its bitrate
      * (encoder_bitrate_fixed) the share of frames is what carries the budget.
@@ -183,7 +183,7 @@ namespace adaptive_bitrate {
      *
      * It keeps asking, from the same first frame, while it finds more frames lost behind it; each
      * time the encoder must still hold the frame before that one. From the first request on, fewer
-     * frames are encoded for a while (`cuadros_alarma`), as after an alarm.
+     * frames are encoded for a while (`alarm_frame_divisor`), as after an alarm.
      */
     void invalidation_requested(std::chrono::steady_clock::time_point now);
 
@@ -268,13 +268,13 @@ namespace adaptive_bitrate {
      * The client asks for at least two, but it reads the parity count of every block from the
      * percentage in its packets and repairs with whatever came. With frames of five packets, two
      * parity packets are 40% of the wire; far from any loss the controller settles for fewer
-     * (estab::Control::paridad_minima), and goes back to what the client asked as soon as it
+     * (abr::Control::min_parity), and goes back to what the client asked as soon as it
      * sees loss or a queue step.
      *
      * @param requested The minimum the client asked for.
      */
     int min_parity(int requested) const {
-      if (mode != mode_e::fec && mode != mode_e::full) {
+      if ((mode != mode_e::fec && mode != mode_e::full) || !active()) {
         return requested;
       }
       return std::min(requested, std::max(0, min_parity_now.load(std::memory_order_relaxed)));
@@ -291,11 +291,11 @@ namespace adaptive_bitrate {
     }
 
     /**
-     * @brief Bitrate to open the encoder with, in kilobits per second.
+     * @brief Encoder bitrate the controller starts from, in kilobits per second.
      *
-     * The image part of the budget the controller starts from, so the first frames do not go
-     * out at the client's full bitrate before the controller has measured anything. Only
-     * meaningful in full mode.
+     * The image part of the starting budget, pushed to the encoder as soon as the controller takes
+     * over (active()), so the frames do not keep going out at the client's full bitrate before it
+     * has measured anything. Only meaningful in full mode.
      */
     int initial_encoder_kbps() const {
       return initial_kbps;
@@ -304,7 +304,7 @@ namespace adaptive_bitrate {
     /**
      * @brief Rate to pace each frame's packets at, in bits per second.
      *
-     * A multiple of the whole budget (`tren_pacing`), so each frame leaves spread over part of
+     * A multiple of the whole budget (`train_pacing`), so each frame leaves spread over part of
      * the frame interval instead of as one burst at line rate. Against a queue that another flow
      * keeps full, a burst loses a run of consecutive packets that no parity can repair; spread
      * out, the losses are scattered and the block parity covers them. Only in full mode, and 0
@@ -315,7 +315,20 @@ namespace adaptive_bitrate {
     }
 
     /**
-     * @brief Whether the controller paces the stream's frames, which is only in full mode.
+     * @brief Whether the client sends what the controller needs to act on the stream.
+     *
+     * Every Moonlight sends the per-frame FEC status, but only one that also reports the loss
+     * stats, the frame arrivals (Frame Stats) or its clock in the periodic ping gives the
+     * controller the loss of whole frames and the queue of each direction. Until one of those
+     * arrives the stream runs as without the controller: the client's bitrate, the configured FEC
+     * and the default pacing.
+     */
+    bool active() const {
+      return active_signals.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Whether the controller may pace the stream's frames, which is only in full mode.
      */
     bool paces() const {
       return mode == mode_e::full;
@@ -354,14 +367,14 @@ namespace adaptive_bitrate {
     const int wire_per_packet;
 
     mutable std::mutex lock;
-    estab::Parametros params;
-    estab::Control control;
-    estab::gamestream::MedidorSenales meter;
+    abr::Params params;
+    abr::Control control;
+    abr::gamestream::SignalMeter meter;
     std::chrono::steady_clock::time_point next_enet_ping {};
     bool have_measurement = false;
     std::uint64_t frames_lost = 0;  ///< Frames the client reported lost, over the whole session.
     std::uint32_t last_frame_index = 0;  ///< The last frame handed to the meter.
-    estab::Medicion last_measurement;
+    abr::Measurement last_measurement;
 
     std::chrono::steady_clock::time_point next_step {};
     std::chrono::steady_clock::time_point last_tick {};
@@ -371,6 +384,7 @@ namespace adaptive_bitrate {
     int last_applied_kbps = 0;
     int initial_kbps = 0;
 
+    std::atomic<bool> active_signals {false};  ///< See active().
     std::atomic<int> target_kbps {0};
     std::atomic<double> pacing {0.0};
     std::atomic<double> budget {0.0};
@@ -388,6 +402,9 @@ namespace adaptive_bitrate {
     double frames_kept() const {
       return std::min(1.0 / divider, rate_keep);
     }
+
+    /// The client sends the controller's signals: from here on the controller acts (active()).
+    void activate();
 
     /// Hand the share of frames to the video thread, in thousandths.
     void publish_frames() {

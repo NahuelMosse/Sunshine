@@ -149,12 +149,18 @@ TEST(AdaptiveBitrateTest, LossReportedInFecStatusRaisesParity) {
 
 TEST(AdaptiveBitrateTest, FullModePacesAtTwiceTheBudget) {
   auto session = make_session(adaptive_bitrate::mode_e::full);
-  // Before any decision the stream already runs on the controller's starting budget, not on
-  // what the client asked for
+  EXPECT_EQ(session.pacing_bps(), 0.0) << "until the client sends its signals the default pacing must be used";
+
+  // From the first report on, and before any decision, the stream runs on the controller's
+  // starting budget, not on what the client asked for
+  auto stats = loss_stats_message(0, 1);
+  ASSERT_TRUE(session.loss_stats(std::chrono::steady_clock::now(), {stats.data(), stats.size()}));
+  EXPECT_TRUE(session.active());
   EXPECT_GT(session.pacing_bps(), 0.0);
   EXPECT_LT(session.pacing_bps(), 2 * 20000 * 1000.0);
   EXPECT_GT(session.initial_encoder_kbps(), 0);
   EXPECT_LT(session.initial_encoder_kbps(), 20000);
+  EXPECT_EQ(session.target_bitrate_kbps(), session.initial_encoder_kbps());
 
   feed_clean_seconds(session, 1);
 
@@ -167,6 +173,9 @@ TEST(AdaptiveBitrateTest, FullModePacesAtTwiceTheBudget) {
 TEST(AdaptiveBitrateTest, PingsEnetOnItsOwnSchedule) {
   auto session = make_session(adaptive_bitrate::mode_e::shadow);
   const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(session.enet_ping_due(start)) << "no extra traffic for a client that does not send the signals";
+  auto stats = loss_stats_message(0, 1);
+  ASSERT_TRUE(session.loss_stats(start, {stats.data(), stats.size()}));
   EXPECT_TRUE(session.enet_ping_due(start));
   EXPECT_FALSE(session.enet_ping_due(start + 1ms));
   EXPECT_TRUE(session.enet_ping_due(start + 100ms));
@@ -177,11 +186,44 @@ TEST(AdaptiveBitrateTest, PingsEnetOnItsOwnSchedule) {
 
 TEST(AdaptiveBitrateTest, ParsesClientPing) {
   auto session = make_session(adaptive_bitrate::mode_e::shadow);
-  // A 16-bit length and the client's clock in milliseconds, little-endian
+  // A 32-bit length of 4 and a timestamp left at zero, as every client fills it for other hosts
+  std::vector<char> blank;
+  put32le(blank, 4);
+  put32le(blank, 0);
+  EXPECT_TRUE(session.client_ping(std::chrono::steady_clock::now(), {blank.data(), blank.size()}));
+  EXPECT_FALSE(session.active()) << "a ping without the client's clock is not one of its signals";
+
+  // The 16-bit length older clients wrote, and the client's clock in milliseconds
   std::vector<char> ping {4, 0};
   put32le(ping, 123456);
   EXPECT_TRUE(session.client_ping(std::chrono::steady_clock::now(), {ping.data(), ping.size()}));
   EXPECT_FALSE(session.client_ping(std::chrono::steady_clock::now(), {ping.data(), 4}));
+  EXPECT_TRUE(session.active());
+}
+
+TEST(AdaptiveBitrateTest, ClientWithoutSignalsKeepsTheStreamAsItWas) {
+  // A client that only sends the per-frame FEC status, like every Moonlight does
+  auto session = make_session(adaptive_bitrate::mode_e::full);
+  const auto start = std::chrono::steady_clock::now();
+  for (int i = 0; i < 180; ++i) {
+    const auto sent = start + std::chrono::microseconds(i * 16667);
+    session.frame_sent(i + 1, sent, sent, 42, 40, 42 * 1040.0, 42 * 1130.0);
+    auto fec = fec_status_message(i + 1, 40, 2, 36, 2);
+    ASSERT_TRUE(session.fec_status({fec.data(), fec.size()}));
+    session.enet_sample(sent + 20ms, 60 + (i % 40) * 10);
+    session.tick(sent + 50ms, 0.060);
+    EXPECT_TRUE(session.idr_requested(sent + 50ms)) << "every IDR request must be answered";
+  }
+  EXPECT_FALSE(session.active());
+  EXPECT_EQ(session.target_bitrate_kbps(), 0);
+  EXPECT_EQ(session.bitrate_to_apply(start + 4s), 0);
+  EXPECT_EQ(session.fec_percentage(20), 20);
+  EXPECT_EQ(session.block_fec_percentage(40), -1);
+  EXPECT_EQ(session.min_parity(2), 2);
+  EXPECT_EQ(session.pacing_bps(), 0.0);
+  EXPECT_EQ(session.budget_bps(), 0.0);
+  EXPECT_EQ(session.take_frame_divider(), 0);
+  EXPECT_FALSE(session.take_idr_request());
 }
 
 TEST(AdaptiveBitrateTest, SteadyRoundTripRaisesNoAlarm) {

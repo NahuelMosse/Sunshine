@@ -2462,8 +2462,8 @@ namespace stream {
 
       session->config = config;
 
-      // The controller needs to see loss, and the only way the client reports it to a Sunshine
-      // host is the per-frame FEC status. Clients that do not send it keep the fixed bitrate.
+      // The controller needs the per-frame FEC status, and acts only once the client also sends its
+      // other signals (adaptive_bitrate::session_t::active); until then the stream is as without it.
       auto adaptive_mode = adaptive_bitrate::mode_from_string(config::stream.adaptive_bitrate);
       if (adaptive_mode != adaptive_bitrate::mode_e::disabled) {
         if (config.mlFeatureFlags & ML_FF_FEC_STATUS) {
@@ -2482,11 +2482,6 @@ namespace stream {
             estimated_audio_bps,
             session->config.minRequiredFecPackets
           );
-          // The encoder opens on the controller's first budget when it can follow it; one that keeps
-          // its bitrate opens on the client's, and the controller takes it down through the frame rate
-          if (adaptive_mode == adaptive_bitrate::mode_e::full && video::changes_bitrate_in_place(session->config.monitor.videoFormat)) {
-            session->config.monitor.bitrate = std::min(session->config.monitor.bitrate, session->adaptive->initial_encoder_kbps());
-          }
           BOOST_LOG(info) << "Adaptive bitrate enabled ["sv << config::stream.adaptive_bitrate << ']';
         } else {
           BOOST_LOG(warning) << "Adaptive bitrate is enabled but the client does not report FEC status; keeping the fixed bitrate"sv;
