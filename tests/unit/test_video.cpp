@@ -711,3 +711,64 @@ TEST_F(Libx264SessionTest, WithASingleReferenceTheLossCostsAnIdrFrame) {
   EXPECT_TRUE(repaired->is_idr()) << "one reference cannot be dropped without losing the picture";
   EXPECT_FALSE(repaired->after_ref_frame_invalidation);
 }
+
+namespace video {
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported);
+}  // namespace video
+
+TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
+  open(0);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 6000);
+  EXPECT_FALSE(session->set_bitrate(0));
+  EXPECT_FALSE(session->set_bitrate(-10));
+  EXPECT_TRUE(session->set_bitrate(6000)) << "already what it has";
+  EXPECT_TRUE(session->set_bitrate(3000));
+  EXPECT_EQ(session->opened_bitrate_kbps(), 3000);
+  EXPECT_TRUE(session->set_bitrate(3000));
+
+  // The stream goes on decoding across the change, in both directions
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+  EXPECT_TRUE(session->set_bitrate(9000));
+  for (int i = 0; i < 3; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr()) << "changing the bitrate must not cost a keyframe";
+  }
+  // The client decoded every frame it was sent
+  if (decoder) {
+    avcodec_send_packet(decoder.get(), nullptr);
+    drain_decoder();
+    EXPECT_EQ(decoded, frame);
+  }
+}
+
+TEST_F(Libx264SessionTest, AppliesTheBitrateTheControllerAsksFor) {
+  open(0);
+  auto events = mail::man->event<int>(mail::bitrate);
+  auto fixed = mail::man->event<int>(mail::bitrate_fixed);
+  bool reported = false;
+
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 6000) << "nothing was asked";
+
+  events->raise(2500);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 2500);
+  EXPECT_FALSE(reported);
+  EXPECT_FALSE(fixed->peek());
+
+  // A bitrate the encoder cannot take: it keeps the one it has, and says so once
+  events->raise(0);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_TRUE(reported);
+  ASSERT_TRUE(fixed->peek());
+  EXPECT_EQ(fixed->pop(0ms), 2500);
+  events->raise(0);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_FALSE(fixed->peek());
+}

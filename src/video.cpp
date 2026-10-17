@@ -576,6 +576,57 @@ namespace video {
     int64_t last_encoded_frame = -1;  ///< The last frame handed to the encoder.
     bool mark_after_invalidation = false;  ///< Whether the next frame out is the one that follows it.
 
+    /**
+     * @brief Change the bitrate by editing the codec context between frames.
+     *
+     * FFmpeg has no general API for this. The libx264 wrapper compares the context with what the
+     * encoder was configured with on every frame and reconfigures it in place when they differ.
+     * The NVENC wrapper does too, but resets the encoder and forces an IDR frame to do it, and the
+     * QuickSync one drains and resets it; AMF, VAAPI, Vulkan, VideoToolbox, MediaFoundation,
+     * libx265 and SVT-AV1 ignore the change. All of those report it as unsupported.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder will pick up the change.
+     */
+    bool set_bitrate(int kbps) override {
+      if (!avcodec_ctx || !avcodec_ctx->codec || kbps <= 0) {
+        return false;
+      }
+      const std::string_view name {avcodec_ctx->codec->name};
+      const bool reconfigurable = name == "libx264"sv;
+      if (!reconfigurable) {
+        return false;
+      }
+
+      auto &ctx = *avcodec_ctx;
+      const int64_t bitrate = int64_t(kbps) * 1000;
+      const int64_t previous = ctx.rc_max_rate > 0 ? ctx.rc_max_rate : ctx.bit_rate;
+      if (previous <= 0 || previous == bitrate) {
+        return previous == bitrate;
+      }
+
+      // Keep every rate-control field in the same proportion it was opened with: the
+      // one-off difference between bit_rate and rc_max_rate that forces VBR, and the VBV
+      // size in frames
+      const int64_t vbr_offset = ctx.rc_max_rate - ctx.bit_rate;
+      ctx.rc_max_rate = bitrate;
+      ctx.bit_rate = bitrate - vbr_offset;
+      if (ctx.rc_min_rate > 0) {
+        ctx.rc_min_rate = bitrate;
+      }
+      if (ctx.rc_buffer_size > 0) {
+        ctx.rc_buffer_size = static_cast<int>(int64_t(ctx.rc_buffer_size) * bitrate / previous);
+      }
+      return true;
+    }
+
+    int opened_bitrate_kbps() const override {
+      if (!avcodec_ctx) {
+        return 0;
+      }
+      return static_cast<int>((avcodec_ctx->rc_max_rate > 0 ? avcodec_ctx->rc_max_rate : avcodec_ctx->bit_rate) / 1000);
+    }
+
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
@@ -645,6 +696,10 @@ namespace video {
       }
     }
 
+    bool set_bitrate(int kbps) override {
+      return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
     /**
      * @brief Submit the next frame to NVENC and return the encoded payload.
      *
@@ -680,6 +735,9 @@ namespace video {
     config_t config;  ///< Stream or encoder configuration captured for the worker.
     int frame_nr;  ///< Next capture-frame number assigned to encoded packets.
     stream::session_t *channel_data;  ///< Stream session forwarded to packet senders.
+    safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new target bitrate in kbps.
+    safe::mail_raw_t::event_t<int> bitrate_fixed_events;  ///< Event saying the encoder keeps its bitrate, in kbps.
+    bool bitrate_fixed_reported = false;  ///< Whether that was already said for this encoder.
   };
 
   /**
@@ -2455,6 +2513,38 @@ namespace video {
   }
 
   /**
+   * @brief Apply the latest bitrate requested by the adaptive bitrate controller, if any.
+   *
+   * Runs on the encoder thread between frames, which is the only place the encoder can be
+   * reconfigured safely.
+   *
+   * An encoder that cannot change it says so once, with the bitrate it keeps, so the controller
+   * stops asking for another one.
+   *
+   * @param session Running encode session.
+   * @param events Bitrate events for this stream.
+   * @param fixed_events Where to say the encoder keeps its bitrate.
+   * @param fixed_reported Whether that was already said for this encoder.
+   */
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported) {
+    if (!events || !events->peek()) {
+      return;
+    }
+    if (auto kbps = events->pop(0ms)) {
+      if (session.set_bitrate(*kbps)) {
+        BOOST_LOG(debug) << "Encoder bitrate set to "sv << *kbps << " kbps"sv;
+      } else if (!fixed_reported) {
+        fixed_reported = true;
+        const int opened = session.opened_bitrate_kbps();
+        BOOST_LOG(info) << "Encoder cannot change bitrate during the session: keeping "sv << opened << " kbps"sv;
+        if (fixed_events && opened > 0) {
+          fixed_events->raise(opened);
+        }
+      }
+    }
+  }
+
+  /**
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
@@ -2509,6 +2599,9 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto bitrate_events = mail->event<int>(mail::bitrate);
+    auto bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
+    bool bitrate_fixed_reported = false;
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2538,6 +2631,8 @@ namespace video {
       if (requested_idr_frame) {
         session->request_idr_frame();
       }
+
+      apply_requested_bitrate(*session, bitrate_events, bitrate_fixed_events, bitrate_fixed_reported);
 
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
@@ -2847,6 +2942,8 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          apply_requested_bitrate(*pos->session, ctx->bitrate_events, ctx->bitrate_fixed_events, ctx->bitrate_fixed_reported);
+
           if (frame_captured && pos->session->convert(*captured_image)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             ctx->shutdown_event->raise(true);
@@ -3054,6 +3151,8 @@ namespace video {
         config,
         1,
         channel_data,
+        mail->event<int>(mail::bitrate),
+        mail->event<int>(mail::bitrate_fixed),
       });
 
       // Wait for join signal
