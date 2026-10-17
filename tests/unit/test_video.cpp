@@ -17,12 +17,14 @@
 
 // ffmpeg includes
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 }
 
 // local includes
 #include <src/config.h>
+#include <src/display_device.h>
 #include <src/video.h>
 
 using namespace std::literals;
@@ -539,4 +541,173 @@ TEST(SoftwareEncoderConversion, Bgr0AndNv12) {
   fallback_nv12_img.height = h;
   fallback_nv12_img.row_pitch = w;
   EXPECT_EQ(device.convert(fallback_nv12_img), 0);
+}
+
+// Defined in src/video.cpp and not part of its header: the encoder session is driven here the way the
+// capture loop does, without a stream around it.
+namespace video {
+  std::unique_ptr<platf::encode_device_t> make_encode_device(platf::display_t &disp, const encoder_t &encoder, const config_t &config);
+  std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device);
+  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp);
+}  // namespace video
+
+/**
+ * @brief libx264 sessions, encoded frame by frame and decoded again.
+ */
+struct Libx264SessionTest: PlatformTestSuite {
+  void SetUp() override {
+    BaseTest::SetUp();
+    if (!video::validate_encoder(video::software, false)) {
+      FAIL() << "Software encoder not available";
+    }
+  }
+
+  /**
+   * @brief Open a libx264 session with `refs` reference frames.
+   */
+  void open(int refs) {
+    const video::config_t config {1280, 720, 60, 6000, 6000, 1, refs, 1, 0, 0, 0, 0};
+    display = platf::display(video::software.platform_formats->dev_type, display_device::map_output_name(config::video.output_name), config);
+    ASSERT_TRUE(display) << "no display to capture from";
+    auto device = video::make_encode_device(*display, video::software, config);
+    ASSERT_TRUE(device);
+    session = video::make_encode_session(display.get(), video::software, config, display->width, display->height, std::move(device));
+    ASSERT_TRUE(session);
+    image = display->alloc_img();
+    ASSERT_TRUE(image);
+    ASSERT_EQ(display->dummy_img(image.get()), 0);
+    packets = mail::man->queue<video::packet_t>(mail::video_packets);
+
+    // An FFmpeg built without decoders still gets every frame type check
+    if (const auto *h264 = avcodec_find_decoder(AV_CODEC_ID_H264)) {
+      decoder.reset(avcodec_alloc_context3(h264));
+      ASSERT_TRUE(decoder);
+      decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
+      decoder->thread_count = 1;
+      ASSERT_EQ(avcodec_open2(decoder.get(), nullptr, nullptr), 0);
+    }
+  }
+
+  /**
+   * @brief Count the frames the decoder has ready.
+   */
+  void drain_decoder() {
+    std::unique_ptr<AVFrame, void (*)(AVFrame *)> out {av_frame_alloc(), [](AVFrame *f) {
+                                                         av_frame_free(&f);
+                                                       }};
+    while (avcodec_receive_frame(decoder.get(), out.get()) == 0) {
+      ++decoded;
+    }
+  }
+
+  /**
+   * @brief Encode one frame and decode what comes out.
+   *
+   * @return The packet, which is the encoder's answer for that frame.
+   */
+  video::packet_t encode_next(bool idr = false) {
+    ++frame;
+    if (idr) {
+      session->request_idr_frame();
+    }
+    if (session->convert(*image) || video::encode(frame, *session, packets, nullptr, {})) {
+      ADD_FAILURE() << "frame " << frame << " was not encoded";
+      return nullptr;
+    }
+    // The capture loop goes back to plain frames after each one; requests come in between
+    session->request_normal_frame();
+    auto packet = packets->pop(2s);
+    if (!packet) {
+      ADD_FAILURE() << "frame " << frame << " produced no packet";
+      return nullptr;
+    }
+    auto *raw = dynamic_cast<video::packet_raw_avcodec *>(packet.get());
+    if (!raw) {
+      ADD_FAILURE() << "libx264 packets are avcodec packets";
+      return nullptr;
+    }
+    EXPECT_EQ(packet->frame_index(), frame);
+    if (decoder) {
+      if (avcodec_send_packet(decoder.get(), raw->av_packet) < 0) {
+        ADD_FAILURE() << "frame " << frame << " does not decode";
+      }
+      drain_decoder();
+    }
+    return packet;
+  }
+
+  std::shared_ptr<platf::display_t> display;
+  std::unique_ptr<video::encode_session_t> session;
+  std::shared_ptr<platf::img_t> image;
+  safe::mail_raw_t::queue_t<video::packet_t> packets;
+  std::unique_ptr<AVCodecContext, void (*)(AVCodecContext *)> decoder {nullptr, [](AVCodecContext *c) {
+                                                                         avcodec_free_context(&c);
+                                                                       }};
+  int64_t frame = 0;
+  int decoded = 0;
+};
+
+TEST_F(Libx264SessionTest, LostFramesAreInvalidatedWithoutAnIdrFrame) {
+  open(8);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 8; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+    EXPECT_FALSE(packet->after_ref_frame_invalidation);
+  }
+
+  // The client lost frames 8 and 9: the next frame must not be predicted from them, and it is not a keyframe
+  // because the older references it keeps are still good
+  session->invalidate_ref_frames(8, 9);
+  auto repaired = encode_next();
+  ASSERT_TRUE(repaired);
+  EXPECT_FALSE(repaired->is_idr()) << "with several references the loss costs no IDR frame";
+  EXPECT_TRUE(repaired->after_ref_frame_invalidation);
+
+  // The same request again, from the same first frame: already done, nothing changes
+  session->invalidate_ref_frames(8, 9);
+  auto again = encode_next();
+  ASSERT_TRUE(again);
+  EXPECT_FALSE(again->is_idr());
+  EXPECT_FALSE(again->after_ref_frame_invalidation);
+
+  // A request that starts inside the range already invalidated and reaches beyond it only covers the rest
+  session->invalidate_ref_frames(9, frame);
+  auto extended = encode_next();
+  ASSERT_TRUE(extended);
+  EXPECT_FALSE(extended->is_idr());
+  EXPECT_TRUE(extended->after_ref_frame_invalidation);
+
+  for (int i = 0; i < 5; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+  }
+
+  // The client decoded every frame it was sent
+  if (decoder) {
+    avcodec_send_packet(decoder.get(), nullptr);
+    drain_decoder();
+    EXPECT_EQ(decoded, frame);
+  }
+}
+
+TEST_F(Libx264SessionTest, WithASingleReferenceTheLossCostsAnIdrFrame) {
+  open(1);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 3; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+  }
+  session->invalidate_ref_frames(2, 3);
+  auto repaired = encode_next();
+  ASSERT_TRUE(repaired);
+  EXPECT_TRUE(repaired->is_idr()) << "one reference cannot be dropped without losing the picture";
+  EXPECT_FALSE(repaired->after_ref_frame_invalidation);
 }
