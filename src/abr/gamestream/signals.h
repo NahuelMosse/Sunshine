@@ -98,8 +98,10 @@ class SignalMeter {
   void client_ping(int64_t arrival_us, uint32_t client_ms);
   // A raw ENet round-trip sample, in ms, as soon as it arrives. Returns its queue over the
   // ten-second minimum and how much it grew since the one 50 ms ago, in seconds; false if the
-  // sample is the same as before or there is nothing to compare with yet.
-  bool enet_sample(int64_t t_us, double ms, double& queue, double& growth);
+  // sample is the same as before or there is nothing to compare with yet. The queue is the
+  // video's: what the client's pings say the uplink added is taken off. `accepted_ms`, if given,
+  // gets the sample as stored, with that taken off, or 0 if it was discarded.
+  bool enet_sample(int64_t t_us, double ms, double& queue, double& growth, double* accepted_ms = nullptr);
   // How much the queue rises and falls by itself, in seconds (Measurement::noise)
   double noise() const { return noise_; }
   // Which optional parts it uses: the queue from the age of the last good frame (queue_age) and what was
@@ -134,6 +136,7 @@ class SignalMeter {
   int      failed_with_status_ = 0;                  // frames with status that were not reassembled
   double   bits_arrived_ = 0;                        // from the advance of the last good frame
   int64_t  summary_arrival_us_ = 0;
+  int64_t  resumed_us_ = INT64_MIN / 2;              // when the summaries came back after a silence
   uint32_t last_good_ = 0;
   bool     had_summary_ = false;
   bool     idr_pending_ = false;                     // waiting for the requested keyframe
@@ -181,6 +184,8 @@ class SignalMeter {
   double   prior_queue_max_ = 0.025;                 // the queue an alarm step can start from
   int64_t  t_enet_floor_us_ = 0;                     // the last ENet sample that touched the floor
   bool     plausible(double ms, std::deque<Sample>& history, int& streak);
+  double   upstream_ms(int64_t t_us) const;
+  double   last_raw_ms_ = 0;                         // the last sample as the host read it
   std::vector<ReceivedTrain> trains_rx_;             // the arrivals since the previous measurement
   int      rtt_low_ = 0, enet_low_ = 0;              // consecutive readings below half the floor
 };

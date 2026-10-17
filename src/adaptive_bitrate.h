@@ -393,6 +393,7 @@ namespace adaptive_bitrate {
     std::atomic<int> divider_changed {0};
     std::atomic<double> host_delay_s {0.0};  ///< Capture to send, the most of the last frames (host_delay).
     int divider = 1;  ///< Control thread only: the divider last handed to the video thread.
+    std::atomic<double> bitrate_keep {1.0};  ///< The share of frames encoded at the last budget step: what bitrate_to_apply scales by.
     int divider_before_alarm = 1;  ///< Control thread only: the divider the last alarm replaced.
     int fixed_kbps = 0;  ///< Control thread only: the bitrate of an encoder that cannot change it, 0 otherwise.
     double rate_keep = 1.0;  ///< Control thread only: the share of frames that brings that encoder down to the budget.

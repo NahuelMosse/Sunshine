@@ -1,6 +1,7 @@
 #include "signals.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace abr {
 namespace gamestream {
@@ -17,6 +18,17 @@ constexpr int64_t kWindowUs = 250000;
 // Over how long the delivery is measured: with the quantization of one frame at each end, 300 ms leaves
 // an error of about 2 %.
 constexpr int64_t kDeliverySpanUs = 300000;
+
+// A summary this long after the previous one was held up on its way, and whatever it carries
+// piled up while the path was silent: it says how far the last good frame advanced, not how fast.
+constexpr int64_t kSilenceUs = 250000;
+
+// How close a client ping has to arrive to an ENet sample to say how much of that round trip is
+// the uplink's queue: a ping every 100 ms and an ack every 25 ms, plus the spread of one that was held.
+constexpr int64_t kPingPairUs = 150000;
+
+// What share of a round trip's rise the ping's drift has to account for to call it the uplink's queue
+constexpr double kUplinkShare = 0.75;
 
 // The minima of the age, of the ping drift and of the round trip, like the control's floor.
 constexpr int64_t kFloorWindowUs = 10000000;
@@ -69,6 +81,15 @@ void SignalMeter::summary(int64_t arrival_us, const LossSummary& r) {
     failed_with_status_ = 0;
     return;
   }
+  // After a silence the summaries that follow are the held-up ones arriving together: what was
+  // delivered cannot be read from their spacing until a whole window of normal ones has gone by.
+  const bool resumed = arrival_us - summary_arrival_us_ > kSilenceUs;
+  if (resumed) {
+    summaries_.clear();
+    window_rx_.clear();
+    bits_arrived_ = 0;
+    resumed_us_ = arrival_us;
+  }
   summary_arrival_us_ = arrival_us;
   if (r.last_good <= last_good_) return;         // no advance, or an old summary
 
@@ -94,7 +115,7 @@ void SignalMeter::summary(int64_t arrival_us, const LossSummary& r) {
       : static_cast<uint32_t>(std::max(0.0, static_cast<double>(r.lost) - not_sent));
 
   const double per_frame = known > 0 ? bytes / known : 0.0;
-  bits_arrived_ += std::max(0.0, bytes - lost * per_frame) * 8.0;
+  if (!resumed) bits_arrived_ += std::max(0.0, bytes - lost * per_frame) * 8.0;
 
   // Frames lost whole send no FEC status: no packet arrived that the client
   // could talk about. They are the lost ones the summary counts and the status does not explain.
@@ -144,7 +165,7 @@ void SignalMeter::summary(int64_t arrival_us, const LossSummary& r) {
   // keyframe or an invalidation, or the host skips frames (the divider), the last good one
   // stays still and its age adds the wait until the next, which is not queue.
   const auto c = sent_.find(r.last_good);
-  if (c != sent_.end() && (cadence_max_us_ <= 0 || (!discards && !idr_pending_))) {
+  if (!resumed && c != sent_.end() && (cadence_max_us_ <= 0 || (!discards && !idr_pending_))) {
     const auto next_it = std::next(c);
     const int64_t next_frame_us = next_it != sent_.end() ? next_it->second.t_first_us : arrival_us;
     if (cadence_max_us_ <= 0 || next_frame_us - c->second.t_first_us <= cadence_max_us_) {
@@ -289,12 +310,43 @@ void SignalMeter::track_drain(int64_t t_us, double ms, double delay_floor) {
   descent_.clear();
 }
 
-bool SignalMeter::enet_sample(int64_t t_us, double ms, double& queue, double& growth) {
+// How much of the round trip of what arrives around t_us is the uplink's queue: the oldest ping that
+// arrived close to it, over its ten-second minimum. Pings held up behind the same stall arrive
+// together, and the oldest of them is the one that measures it.
+double SignalMeter::upstream_ms(int64_t t_us) const {
+  double v_min = 0, near_max = 0;
+  bool first = true, near = false;
+  for (const Sample& x : ping_drifts_) {
+    v_min = first ? x.v : std::min(v_min, x.v);
+    first = false;
+    if (std::llabs(t_us - x.t_us) > kPingPairUs) continue;
+    near_max = near ? std::max(near_max, x.v) : x.v;
+    near = true;
+  }
+  return near ? std::max(0.0, near_max - v_min) : 0.0;
+}
+
+bool SignalMeter::enet_sample(int64_t t_us, double ms, double& queue, double& growth, double* accepted_ms) {
+  if (accepted_ms) *accepted_ms = 0;
   if (ms <= 0 || !plausible(ms, raw_, enet_low_)) return false;
   // The host reads the same sample several times between two acks; one equal to the previous says
   // nothing the alarm needs —it only matters when the queue grows— and counting it twice put in
   // growth intervals of zero right in the middle of the ramp.
-  if (!raw_.empty() && raw_.back().v == ms) return false;
+  if (!raw_.empty() && last_raw_ms_ == ms) return false;
+  last_raw_ms_ = ms;
+  // The ENet round trip crosses both ways, and the ping's drift says how much of what it rose is the
+  // uplink's queue, which is not the video's: the sample is stored without it, so the floor, the
+  // noise and the draining are those of the video's path alone. Never more than what the round trip
+  // rose over its floor, and only if the drift accounts for most of that rise: a path that lengthens
+  // adds the same to both directions, so its ping drifts by half of what the round trip rose, and
+  // that is a step in the path, not a queue in the uplink.
+  {
+    double floor_ms = ms;
+    for (const Sample& x : raw_) floor_ms = std::min(floor_ms, x.v);
+    const double rise = ms - floor_ms, upstream = upstream_ms(t_us);
+    if (upstream >= kUplinkShare * rise) ms -= std::min(upstream, rise);
+  }
+  if (accepted_ms) *accepted_ms = ms;
   raw_.push_back({t_us, ms});
   while (t_us - raw_.front().t_us > kFloorWindowUs) raw_.pop_front();
   update_noise(t_us);
@@ -386,10 +438,6 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
   m = Measurement{};
   m.t = now_us / 1e6;
   m.rtt = rtt_;
-  // With no arrival time for anything, the delay there is is the round trip: the queue is how far it
-  // came off its minimum, the same computation the control does with the one-way delay.
-  m.owd_min = rtt_;
-  m.owd_mean = rtt_;
   m.noise = noise_;
   if (drain_rate_ > 0) {
     m.drain_rate = drain_rate_;
@@ -407,8 +455,10 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
   // delivery guarantee, and reading its absence as "nothing arrived" made the loop back off over a
   // drop that did not exist. The same while the client waits for a keyframe: the last good
   // frame does not advance even though frames arrive.
+  // And after a silence, until the held-up summaries have left the window.
   const bool fresh_summary = had_summary_ && !idr_pending_ &&
-                              now_us - summary_arrival_us_ <= kWindowUs;
+                              now_us - summary_arrival_us_ <= kWindowUs &&
+                              now_us - resumed_us_ >= kWindowUs;
   m.received_rate = fresh_summary ? rate(window_rx_) + audio_bps_
                                    : m.sent_rate * (1.0 - m.loss);
   if (use_same_frames_ && fresh_summary && t_same_frames_us_ > 0 && now_us - t_same_frames_us_ <= kWindowUs) {
@@ -426,13 +476,22 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
   prune_floor(rtts_);
   prune_floor(ages_);
   prune_floor(ping_drifts_);
+  // The round trip without what the uplink's queue added to it. With no arrival time for anything, the
+  // delay there is the round trip: the queue is how far it came off its minimum, the same computation
+  // the control does with the one-way delay.
+  double rtt_min = rtts_.front().v;
+  for (const Sample& x : rtts_) rtt_min = std::min(rtt_min, x.v);
+  const double rise_ms = rtt_ * 1000.0 - rtt_min, upstream = upstream_ms(now_us);
+  const double rtt_video = upstream >= kUplinkShare * rise_ms
+      ? rtt_min / 1000.0 + std::max(0.0, rise_ms - upstream) / 1000.0 : rtt_;
+  m.owd_min = rtt_video;
+  m.owd_mean = rtt_video;
   if (use_age_ && !ages_.empty()) {
-    double age_min = ages_.front().v, recent = 1e18, rtt_min = rtts_.front().v;
+    double age_min = ages_.front().v, recent = 1e18;
     for (const Sample& x : ages_) {
       age_min = std::min(age_min, x.v);
       if (now_us - x.t_us <= age_recent_us_) recent = std::min(recent, x.v);
     }
-    for (const Sample& x : rtts_) rtt_min = std::min(rtt_min, x.v);
     double uplink = 0;
     if (!ping_drifts_.empty()) {
       double v_min = ping_drifts_.front().v;
@@ -441,14 +500,17 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
     }
     if (recent < 1e17) {
       const double queue_age = std::max(0.0, recent - age_min - uplink) / 1000.0;
-      const double rtt_queue = std::max(0.0, rtt_ - rtt_min / 1000.0);
-      if (queue_age > rtt_queue) m.owd_min = m.owd_mean = rtt_ + (queue_age - rtt_queue);
+      const double rtt_queue = std::max(0.0, rtt_video - rtt_min / 1000.0);
+      if (queue_age > rtt_queue) m.owd_min = m.owd_mean = rtt_video + (queue_age - rtt_queue);
     }
   }
   // ── the dispersion of each frame (Frame Stats) ────────────────────────────
   // Only the frames the bottleneck spread out: one that arrives as spaced as it left did not
   // cross anything narrower than the sender itself, and its quotient measures the sender. The client counts
   // RTP bytes; the bottleneck also charges the headers, in the proportion of the frame.
+  // Except right after a silence: a frame that arrived across the stall spans it, which is not what the
+  // bottleneck spread it by, and its arrival report comes in the next few summaries.
+  if (now_us - resumed_us_ < kWindowUs) trains_rx_.clear();
   for (const ReceivedTrain& r : trains_rx_) {
     const auto it = sent_.find(r.index);
     if (it == sent_.end() || r.bytes == 0) continue;

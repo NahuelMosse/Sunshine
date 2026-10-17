@@ -239,6 +239,53 @@ TEST(AdaptiveBitrateTest, SteadyRoundTripRaisesNoAlarm) {
   EXPECT_EQ(session.budget_bps(), budget);
 }
 
+namespace {
+  std::vector<char> client_ping_message(std::uint32_t client_ms) {
+    std::vector<char> out;
+    put32le(out, 4);
+    put32le(out, client_ms);
+    return out;
+  }
+
+  // Four seconds in, a path that is steady at 60 ms with the client's ping arriving on time, then a
+  // sample of `late_ms` that arrives together with a ping held up `held_ms`
+  void steady_then_late_sample(adaptive_bitrate::session_t &session, double late_ms, int held_ms) {
+    feed_clean_seconds(session, 3);
+    (void) session.take_frame_divider();
+    const auto start = std::chrono::steady_clock::now() + 4s;
+    for (int i = 0; i < 160; ++i) {
+      const auto at = start + std::chrono::milliseconds(25 * i);
+      if (i % 4 == 0) {
+        auto ping = client_ping_message(std::uint32_t(100000 + 25 * i));
+        ASSERT_TRUE(session.client_ping(at, {ping.data(), ping.size()}));
+      }
+      session.enet_sample(at, 60 + (i % 2) * 0.4);
+    }
+    const auto at = start + 4s;
+    auto ping = client_ping_message(std::uint32_t(100000 + 4000 - held_ms));
+    ASSERT_TRUE(session.client_ping(at, {ping.data(), ping.size()}));
+    session.enet_sample(at + 1ms, late_ms);
+  }
+}  // namespace
+
+// The round trip that rose together with the client's ping is the uplink's: it does not make the
+// host skip frames, nor cut the budget
+TEST(AdaptiveBitrateTest, ASampleHeldUpWithItsPingChangesNeitherFramesNorBudget) {
+  auto session = make_session(adaptive_bitrate::mode_e::full);
+  steady_then_late_sample(session, 560, 500);
+  const double budget = session.budget_bps();
+  EXPECT_EQ(session.take_frame_divider(), 0);
+  EXPECT_LT(session.queue_s(), 0.005);
+  EXPECT_GT(budget, 0.0);
+}
+
+// The same sample with the ping on time is the video's queue, and the frames in flight go down
+TEST(AdaptiveBitrateTest, TheSameSampleWithThePingOnTimeSkipsFrames) {
+  auto session = make_session(adaptive_bitrate::mode_e::full);
+  steady_then_late_sample(session, 560, 0);
+  EXPECT_NE(session.take_frame_divider(), 0);
+}
+
 TEST(AdaptiveBitrateTest, ShadowModeNeverTouchesFec) {
   auto session = make_session(adaptive_bitrate::mode_e::shadow);
   EXPECT_EQ(session.fec_percentage(20), 20);

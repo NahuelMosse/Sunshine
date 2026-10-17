@@ -263,11 +263,24 @@ namespace adaptive_bitrate {
       return;
     }
     last_rtt_s = sample_ms / 1000.0;
+    double now_budget = 0;
+    double queue_seen = 0;
+    double growth = 0;
+    double accepted_ms = 0;
+    bool cut = false;
+    bool undone = false;
+    bool queued = false;
+    {
+      std::lock_guard lg {lock};
+      queued = meter.enet_sample(to_us(now), sample_ms, queue_seen, growth, &accepted_ms);
+    }
     // The frames in flight, within what the encoder can still predict from (take_frame_divider).
-    // Up at once, down only once the round trip has stayed short for half a second.
-    if ((params.frames_in_flight > 0 || divider > 1) && (mode == mode_e::fec || mode == mode_e::full)) {
+    // Up at once, down only once the round trip has stayed short for half a second. From the sample as
+    // the meter keeps it —without what the uplink's queue added, and only if it was taken at all: a
+    // repeated one or one the meter discarded says nothing new about the video's path.
+    if (accepted_ms > 0 && (params.frames_in_flight > 0 || divider > 1) && (mode == mode_e::fec || mode == mode_e::full)) {
       // The round trip and the time frames wait in the host before leaving (host_delay)
-      const double in_flight_s = sample_ms / 1000.0 + host_delay_s.load(std::memory_order_relaxed);
+      const double in_flight_s = accepted_ms / 1000.0 + host_delay_s.load(std::memory_order_relaxed);
       const int wanted = params.frames_in_flight > 0 ? std::clamp(static_cast<int>(std::ceil(in_flight_s * framerate / params.frames_in_flight)), 1, 4) : 1;
       if (wanted >= divider) {
         divider_raised_at = now;
@@ -277,17 +290,11 @@ namespace adaptive_bitrate {
         publish_frames();
       }
     }
-
-    double now_budget = 0;
-    double queue_seen = 0;
-    double growth = 0;
-    bool cut = false;
-    bool undone = false;
+    if (!queued) {
+      return;
+    }
     {
       std::lock_guard lg {lock};
-      if (!meter.enet_sample(to_us(now), sample_ms, queue_seen, growth)) {
-        return;
-      }
       // ESTAB_METRICAS: métrica temporal del sandbox, se saca antes del PR
       static const bool metricas = std::getenv("ESTAB_METRICAS") && *std::getenv("ESTAB_METRICAS");
       if (metricas) {
@@ -338,6 +345,7 @@ namespace adaptive_bitrate {
     if (before > 0) {
       target_kbps.store(static_cast<int>(target_kbps.load(std::memory_order_relaxed) * now_budget / before), std::memory_order_relaxed);
     }
+    bitrate_keep.store(frames_kept(), std::memory_order_relaxed);
     BOOST_LOG(debug) << (undone ? "Adaptive bitrate alarm undone: budget="sv : "Adaptive bitrate alarm: budget="sv) << static_cast<int>(now_budget / 1000.0)
                      << " before="sv << static_cast<int>(before / 1000.0)
                      << " queue="sv << std::lround(queue_seen * 1000.0)
@@ -411,6 +419,7 @@ namespace adaptive_bitrate {
     // What the encoder is asked for: the image budget, scaled up by what the encoder has been
     // falling short of it
     target_kbps.store(static_cast<int>(decision.encoder_request / 1000.0), std::memory_order_relaxed);
+    bitrate_keep.store(frames_kept(), std::memory_order_relaxed);
     target_fec.store(static_cast<int>(std::lround(decision.repair * 100.0)), std::memory_order_relaxed);
     if (params.train_pacing > 0) {
       pacing.store(params.train_pacing * decision.budget, std::memory_order_relaxed);
@@ -490,8 +499,10 @@ namespace adaptive_bitrate {
       return 0;
     }
     // The encoder spreads its bitrate over the frame rate it was opened with: with a share of the
-    // frames encoded, it has to be asked for that many times more to fill the same budget
-    const int kbps = static_cast<int>(target_kbps.load(std::memory_order_relaxed) / frames_kept());
+    // frames encoded, it has to be asked for that many times more to fill the same budget. The share
+    // is the one at the last budget step, so the frames and the bitrate that makes up for them change
+    // together with the budget and not ahead of it
+    const int kbps = static_cast<int>(target_kbps.load(std::memory_order_relaxed) / bitrate_keep.load(std::memory_order_relaxed));
     if (kbps <= 0) {
       return 0;
     }
