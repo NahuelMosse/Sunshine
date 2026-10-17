@@ -2554,7 +2554,7 @@ namespace video {
    * reconfigured safely.
    *
    * An encoder that cannot change it says so once, with the bitrate it keeps, so the controller
-   * stops asking for another one.
+   * paces the frame rate instead.
    *
    * @param session Running encode session.
    * @param events Bitrate events for this stream.
@@ -2571,7 +2571,7 @@ namespace video {
       } else if (!fixed_reported) {
         fixed_reported = true;
         const int opened = session.opened_bitrate_kbps();
-        BOOST_LOG(info) << "Encoder cannot change bitrate during the session: keeping "sv << opened << " kbps"sv;
+        BOOST_LOG(info) << "Encoder cannot change bitrate during the session: keeping "sv << opened << " kbps and pacing the frame rate"sv;
         if (fixed_events && opened > 0) {
           fixed_events->raise(opened);
         }
@@ -2637,6 +2637,10 @@ namespace video {
     auto bitrate_events = mail->event<int>(mail::bitrate);
     auto bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
     bool bitrate_fixed_reported = false;
+    auto frame_divider_events = mail->event<int>(mail::frame_divider);
+    // The share of captured frames to encode, and what has accumulated of it since the last one
+    double frames_kept = 1.0;
+    double frames_owed = 0.0;
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2669,11 +2673,27 @@ namespace video {
 
       apply_requested_bitrate(*session, bitrate_events, bitrate_fixed_events, bitrate_fixed_reported);
 
+      if (frame_divider_events->peek()) {
+        if (auto per_mille = frame_divider_events->pop(0ms)) {
+          frames_kept = std::clamp(*per_mille / 1000.0, 0.001, 1.0);
+        }
+      }
+
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          // Behind a long queue the adaptive bitrate controller asks for fewer frames, so that a
+          // loss stays repairable, and with an encoder that keeps its bitrate the share of frames
+          // carries the budget (adaptive_bitrate::session_t::take_frame_divider)
+          if (!requested_idr_frame && frames_kept < 1.0) {
+            frames_owed += frames_kept;
+            if (frames_owed < 1.0) {
+              continue;
+            }
+            frames_owed -= 1.0;
+          }
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
