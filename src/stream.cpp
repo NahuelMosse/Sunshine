@@ -91,27 +91,6 @@ namespace stream {
   constexpr double estimated_audio_bps = 300000.0;
 
   /**
-   * @brief The last unsmoothed ENet round trip measured on a peer, in milliseconds.
-   *
-   * Stock ENet only keeps the smoothed round trip, which trails a change in the queue by several
-   * acknowledgements. An ENet that also stores the raw sample of each acknowledgement as
-   * `roundTripTimeSample` lets the controller see the queue as it grows; without it the smoothed
-   * value is used, and the controller reacts later.
-   *
-   * @tparam Peer ENet peer type.
-   * @param peer Peer of the control stream.
-   * @return Round trip sample in milliseconds.
-   */
-  template<typename Peer>
-  double enet_rtt_sample_ms(const Peer &peer) {
-    if constexpr (requires { peer.roundTripTimeSample; }) {
-      return peer.roundTripTimeSample;
-    } else {
-      return peer.roundTripTime;
-    }
-  }
-
-  /**
    * @brief Enumerates supported socket options.
    */
   enum class socket_e : int {
@@ -1195,7 +1174,7 @@ namespace stream {
     server->map(packetTypes[IDX_FRAME_STATS], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_FRAME_STATS]"sv;
 
-      if (session->adaptive && !session->adaptive->frame_stats(payload)) {
+      if (session->adaptive && !session->adaptive->frame_stats(std::chrono::steady_clock::now(), payload)) {
         BOOST_LOG(warning) << "Malformed frame stats of "sv << payload.size() << " bytes"sv;
       }
     });
@@ -1419,12 +1398,11 @@ namespace stream {
               if (session->adaptive->enet_ping_due(now)) {
                 enet_peer_ping(session->control.peer);
               }
-              session->adaptive->enet_sample(now, enet_rtt_sample_ms(*session->control.peer));
               if (auto divider = session->adaptive->take_frame_divider()) {
                 session->video.frame_divider_events->raise(divider);
               }
               adaptive_active = true;
-              session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0, enet_rtt_sample_ms(*session->control.peer) / 1000.0);
+              session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0);
               if (auto kbps = session->adaptive->bitrate_to_apply(now)) {
                 session->video.bitrate_events->raise(kbps);
               }

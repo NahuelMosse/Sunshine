@@ -325,10 +325,8 @@ struct Params {
   double parity_memory = 10.0;
   // Mean loss above which a burst is counted, to know whether it repeats.
   double parity_burst = 0.01;
-  // The ENet round trip, on the host side: how many milliseconds between the host's
-  // pings, and whether the sample of each ack is read (1) or the value ENet smooths with 1/8 (0).
+  // The ENet round trip, on the host side: how many milliseconds between the host's pings.
   double enet_ping_ms = 25;
-  int    enet_rtt_raw = 1;
   // In the first seconds, the parity is decided with at least this loss.
   double parity_startup = 0.10;
   double parity_startup_s = 2.0;

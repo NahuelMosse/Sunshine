@@ -42,7 +42,7 @@ const std::vector<Field>& table() {
       FIELD_D(encoder_compensation_max), FIELD_D(encoder_time_const), FIELD_I(encoder_release_cycles),      FIELD_D(bitrate_min), FIELD_D(bitrate_max), FIELD_D(startup_fraction),
       FIELD_I(mtu), FIELD_I(header_bytes), FIELD_D(audio_bps),
       FIELD_I(gf_shards), FIELD_I(blocks_per_frame), FIELD_I(fec_min_packets), FIELD_I(fec_min_clean), FIELD_D(fec_clean_s),
-      FIELD_I(parity_in_packets), FIELD_D(parity_block_failure), FIELD_D(parity_repair_failure), FIELD_D(fec_max_repair), FIELD_D(parity_memory), FIELD_D(parity_burst), FIELD_D(parity_startup), FIELD_D(parity_startup_s), FIELD_D(enet_ping_ms), FIELD_I(enet_rtt_raw),  };
+      FIELD_I(parity_in_packets), FIELD_D(parity_block_failure), FIELD_D(parity_repair_failure), FIELD_D(fec_max_repair), FIELD_D(parity_memory), FIELD_D(parity_burst), FIELD_D(parity_startup), FIELD_D(parity_startup_s), FIELD_D(enet_ping_ms),  };
   return t;
 }
 

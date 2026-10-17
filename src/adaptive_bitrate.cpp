@@ -200,7 +200,7 @@ namespace adaptive_bitrate {
     return true;
   }
 
-  bool session_t::frame_stats(std::string_view payload) {
+  bool session_t::frame_stats(std::chrono::steady_clock::time_point now, std::string_view payload) {
     if (payload.size() < frame_stats_header) {
       return false;
     }
@@ -209,7 +209,10 @@ namespace adaptive_bitrate {
     if (payload.size() < frame_stats_header + count * frame_stats_entry) {
       return false;
     }
-    std::lock_guard lg {lock};
+    {
+      std::lock_guard lg {lock};
+      activate();
+    }
     for (std::size_t i = 0; i < count; ++i) {
       const unsigned char *e = data + frame_stats_header + i * frame_stats_entry;
       abr::gamestream::ReceivedTrain arrival;
@@ -218,9 +221,16 @@ namespace adaptive_bitrate {
       arrival.t_last_us = be32(e + 8);
       arrival.bytes = be32(e + 12);
       arrival.packets = be16(e + 16);
-      meter.train(arrival);
+      double queue_seen = 0;
+      double growth = 0;
+      double sample_ms = 0;
+      bool queued;
+      {
+        std::lock_guard lg {lock};
+        queued = meter.train(arrival, queue_seen, growth, &sample_ms);
+      }
+      queue_sample(now, queued, queue_seen, growth, sample_ms);
     }
-    activate();
     return true;
   }
 
@@ -258,26 +268,18 @@ namespace adaptive_bitrate {
     return true;
   }
 
-  void session_t::enet_sample(std::chrono::steady_clock::time_point now, double sample_ms) {
-    if (mode == mode_e::disabled || !active() || sample_ms <= 0) {
+  void session_t::queue_sample(std::chrono::steady_clock::time_point now, bool queued, double queue_seen, double growth, double sample_ms) {
+    if (mode == mode_e::disabled || !active()) {
       return;
     }
-    last_rtt_s = sample_ms / 1000.0;
     double now_budget = 0;
-    double queue_seen = 0;
-    double growth = 0;
-    double accepted_ms = 0;
+    double accepted_ms = sample_ms;
     bool cut = false;
     bool undone = false;
-    bool queued = false;
-    {
-      std::lock_guard lg {lock};
-      queued = meter.enet_sample(to_us(now), sample_ms, queue_seen, growth, &accepted_ms);
-    }
     // The frames in flight, within what the encoder can still predict from (take_frame_divider).
-    // Up at once, down only once the round trip has stayed short for half a second. From the sample as
-    // the meter keeps it —without what the uplink's queue added, and only if it was taken at all: a
-    // repeated one or one the meter discarded says nothing new about the video's path.
+    // Up at once, down only once the round trip has stayed short for half a second. From the
+    // sample the meter stored, as a round trip, and only if it took one: a frame it discarded
+    // says nothing new about the video's path.
     if (accepted_ms > 0 && (params.frames_in_flight > 0 || divider > 1) && (mode == mode_e::fec || mode == mode_e::full)) {
       // The round trip and the time frames wait in the host before leaving (host_delay)
       const double in_flight_s = accepted_ms / 1000.0 + host_delay_s.load(std::memory_order_relaxed);
@@ -382,7 +384,7 @@ namespace adaptive_bitrate {
     return true;
   }
 
-  void session_t::tick(std::chrono::steady_clock::time_point now, double rtt_s, double rtt_sample_s) {
+  void session_t::tick(std::chrono::steady_clock::time_point now, double rtt_s) {
     if (mode == mode_e::disabled || !active() || now < next_step) {
       return;
     }
@@ -403,7 +405,10 @@ namespace adaptive_bitrate {
     {
       std::lock_guard lg {lock};
       lost_so_far = frames_lost;
-      meter.rtt(params.enet_rtt_raw && rtt_sample_s > 0 ? rtt_sample_s : rtt_s);
+      if (rtt_s > 0) {
+        last_rtt_s = rtt_s;
+      }
+      meter.rtt(rtt_s);
       abr::Measurement measurement;
       if (meter.measure(to_us(now), measurement)) {
         last_measurement = measurement;

@@ -122,21 +122,6 @@ namespace adaptive_bitrate {
     bool client_ping(std::chrono::steady_clock::time_point now, std::string_view payload);
 
     /**
-     * @brief Feed the last round trip ENet measured, as soon as it is read.
-     *
-     * Between two controller steps, a step in the queue that only a narrower path explains cuts
-     * the budget right away (abr::Control::alarm): a path that narrows threefold overflows a
-     * quarter-second router buffer in about 150 ms, sooner than the next step.
-     *
-     * @param now Current time.
-     * @param sample_ms ENet's last round-trip sample, in milliseconds; 0 if none yet.
-     */
-    void enet_sample(std::chrono::steady_clock::time_point now, double sample_ms);
-
-    /**
-     * @brief The queue the last ENet sample showed over its floor, in seconds.
-     */
-    /**
      * @brief Whether the controller wants a key frame sent now, once.
      *
      * When the path narrows, what left in the last hundred milliseconds is being lost, and the
@@ -209,13 +194,18 @@ namespace adaptive_bitrate {
      *
      * GameStream reserves this message and nothing ever filled it. From how much more spread out
      * a frame's packets arrived than they left, the controller reads the width of the path even
-     * while the frames are small (a menu). Clients that do not send it leave the controller
-     * measuring without it.
+     * while the frames are small (a menu). From how much later each frame arrived, relative to
+     * when it left, it reads the video's own queue as it grows: between two controller steps, a
+     * step in that queue that only a narrower path explains cuts the budget right away
+     * (abr::Control::alarm), since a path that narrows threefold overflows a quarter-second router
+     * buffer in about 150 ms, sooner than the next step. Clients that do not send it leave the
+     * controller measuring without it.
      *
+     * @param now Current time.
      * @param payload Message payload as received on the control stream.
      * @return false if the payload is malformed.
      */
-    bool frame_stats(std::string_view payload);
+    bool frame_stats(std::chrono::steady_clock::time_point now, std::string_view payload);
     /**
      * @brief Whether the host should send an ENet ping now.
      *
@@ -232,11 +222,8 @@ namespace adaptive_bitrate {
      * @brief Run a controller step if one is due.
      * @param now Current time.
      * @param rtt_s Round-trip time of the control stream, in seconds, as ENet smooths it.
-     * @param rtt_sample_s The last round trip ENet measured, before smoothing, in seconds; 0 if
-     * none yet. ENet's smoothing takes about eight samples to follow a queue that fills in a
-     * fifth of a second, which is how fast a path that narrows threefold overflows.
      */
-    void tick(std::chrono::steady_clock::time_point now, double rtt_s, double rtt_sample_s = 0);
+    void tick(std::chrono::steady_clock::time_point now, double rtt_s);
 
     /**
      * @brief FEC percentage to use for the next frame.
@@ -404,6 +391,9 @@ namespace adaptive_bitrate {
       return std::min(1.0 / divider, rate_keep);
     }
 
+    /// What a frame's arrival showed of the queue: the alarm, and the frames in flight.
+    void queue_sample(std::chrono::steady_clock::time_point now, bool queued, double queue_seen, double growth, double sample_ms);
+
     /// The client sends the controller's signals: from here on the controller acts (active()).
     void activate();
 
@@ -413,7 +403,7 @@ namespace adaptive_bitrate {
     }
     std::chrono::steady_clock::time_point divider_raised_at {};
     std::chrono::steady_clock::time_point last_idr_at {};  ///< The last IDR request answered.
-    double last_rtt_s = 0;  ///< The last round trip ENet measured, in seconds.
+    double last_rtt_s = 0;  ///< The last round trip ENet measured (smoothed), in seconds.
     std::atomic<int> target_fec {-1};
     std::atomic<int> min_parity_now {2};
 

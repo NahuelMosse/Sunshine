@@ -82,7 +82,15 @@ class SignalMeter {
   // The arrival of a frame (Frame Stats). With it the control measures the dispersion: how far the
   // packets of a frame spread out when crossing the bottleneck, which gives the pipe's width
   // even if the frame is small. A client that does not send it leaves the measurement as if without it.
-  void train(const ReceivedTrain& r) { trains_rx_.push_back(r); }
+  // It also gives the video's one-way delay: the client clock at the first packet minus the host
+  // clock when it left. The clocks are not aligned, so only its rise over the ten-second minimum
+  // means anything: the queue in front of the video, without the uplink's part. Each frame is a
+  // sample placed where a ping sent along with it would have come back. Returns the queue over the
+  // floor and how much it grew since the sample 50 ms before, in seconds; false if there is nothing
+  // to compare with yet. See queue_sample.
+  // `sample_ms`, if given, gets the sample as a round trip in ms, or 0 if it was not taken.
+  bool train(const ReceivedTrain& r, double& queue, double& growth, double* sample_ms = nullptr);
+  void train(const ReceivedTrain& r) { double queue, growth; train(r, queue, growth); }
   // ENet's round trip for the control channel's peer, in seconds, as the host reads it.
   // One below half the floor is not a shorter path but a broken reading —on Windows a round trip of
   // 1 ms shows up now and then—, and as a floor it poisons ten seconds of queue:
@@ -96,12 +104,6 @@ class SignalMeter {
   // The client's periodic ping, with its monotonic clock in milliseconds. How far its arrival
   // drifts from that clock is the uplink's queue, which the summaries come back through.
   void client_ping(int64_t arrival_us, uint32_t client_ms);
-  // A raw ENet round-trip sample, in ms, as soon as it arrives. Returns its queue over the
-  // ten-second minimum and how much it grew since the one 50 ms ago, in seconds; false if the
-  // sample is the same as before or there is nothing to compare with yet. The queue is the
-  // video's: what the client's pings say the uplink added is taken off. `accepted_ms`, if given,
-  // gets the sample as stored, with that taken off, or 0 if it was discarded.
-  bool enet_sample(int64_t t_us, double ms, double& queue, double& growth, double* accepted_ms = nullptr);
   // How much the queue rises and falls by itself, in seconds (Measurement::noise)
   double noise() const { return noise_; }
   // Which optional parts it uses: the queue from the age of the last good frame (queue_age) and what was
@@ -185,9 +187,15 @@ class SignalMeter {
   int64_t  t_enet_floor_us_ = 0;                     // the last ENet sample that touched the floor
   bool     plausible(double ms, std::deque<Sample>& history, int& streak);
   double   upstream_ms(int64_t t_us) const;
-  double   last_raw_ms_ = 0;                         // the last sample as the host read it
+  bool     queue_sample(int64_t t_us, double ms, double& queue, double& growth, double* sample_ms);
+  std::deque<Sample> delays_;                        // the video's one-way delay per frame, ten seconds
+  uint32_t delay_ref_ = 0;                           // the first frame's, for the clocks' offset
+  double   delay_base_ms_ = 0;                       // the round trip when that first one arrived
+  bool     has_delay_ref_ = false;
+  double   stall_ms_ = 0;                            // the last rise of the round trip that the video did not show
+  int64_t  stall_us_ = INT64_MIN / 2;
   std::vector<ReceivedTrain> trains_rx_;             // the arrivals since the previous measurement
-  int      rtt_low_ = 0, enet_low_ = 0;              // consecutive readings below half the floor
+  int      rtt_low_ = 0;            // consecutive readings below half the floor
 };
 
 }  // namespace gamestream

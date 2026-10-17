@@ -37,6 +37,20 @@ constexpr int64_t kFloorWindowUs = 10000000;
 // bottleneck and not the sender's.
 constexpr double kMinDispersion = 1.1;
 
+// The least time between two samples of the video's delay: one per frame would be read as growth
+// from intervals of 16 ms.
+constexpr int64_t kSampleGapUs = 40000;
+
+// How recent the last frame's delay has to be to say anything about the queue now, and over how
+// long its minimum is taken so that one frame's burst does not count.
+constexpr int64_t kDelayFreshUs = 500000;
+constexpr int64_t kDelayRecentUs = 100000;
+
+// A rise of the smoothed round trip that the video's delay does not show counts as path noise when it
+// is over kStallMinMs, for kStallHoldUs.
+constexpr double kStallMinMs = 10;
+constexpr int64_t kStallHoldUs = 5000000;
+
 }  // namespace
 
 void SignalMeter::sent(const SentFrame& c) {
@@ -326,28 +340,42 @@ double SignalMeter::upstream_ms(int64_t t_us) const {
   return near ? std::max(0.0, near_max - v_min) : 0.0;
 }
 
-bool SignalMeter::enet_sample(int64_t t_us, double ms, double& queue, double& growth, double* accepted_ms) {
-  if (accepted_ms) *accepted_ms = 0;
-  if (ms <= 0 || !plausible(ms, raw_, enet_low_)) return false;
-  // The host reads the same sample several times between two acks; one equal to the previous says
-  // nothing the alarm needs —it only matters when the queue grows— and counting it twice put in
-  // growth intervals of zero right in the middle of the ramp.
-  if (!raw_.empty() && last_raw_ms_ == ms) return false;
-  last_raw_ms_ = ms;
-  // The ENet round trip crosses both ways, and the ping's drift says how much of what it rose is the
-  // uplink's queue, which is not the video's: the sample is stored without it, so the floor, the
-  // noise and the draining are those of the video's path alone. Never more than what the round trip
-  // rose over its floor, and only if the drift accounts for most of that rise: a path that lengthens
-  // adds the same to both directions, so its ping drifts by half of what the round trip rose, and
-  // that is a step in the path, not a queue in the uplink.
-  {
-    double floor_ms = ms;
-    for (const Sample& x : raw_) floor_ms = std::min(floor_ms, x.v);
-    const double rise = ms - floor_ms, upstream = upstream_ms(t_us);
-    if (upstream >= kUplinkShare * rise) ms -= std::min(upstream, rise);
+// The video's one-way delay of each frame, in the shape the queue measurements want: a round trip.
+// It is that of the frame's last packet, which also carries the queue the frame itself made. The
+// clocks are unrelated, so the delay is read from the first frame and kept as its rise over the
+// ten-second minimum (which also takes the clock's drift out), added to the round trip the host had
+// then. The sample is placed at the time the frame would have taken to come back, so the floor, the
+// noise and the draining work on it as they would on a ping sent along with the frame. It does not
+// cross the uplink, so there is no queue of the uplink to take off. Being the video's own, the swing
+// of an AQM's queue (fq_codel) also reads as noise, and the queue target grows with it.
+bool SignalMeter::train(const ReceivedTrain& r, double& queue, double& growth, double* sample_ms) {
+  if (sample_ms) *sample_ms = 0;
+  trains_rx_.push_back(r);
+  const auto it = sent_.find(r.index);
+  if (it == sent_.end() || rtt_ <= 0 || r.packets == 0) return false;
+  const int64_t sent_us = it->second.t_last_us;
+  const uint32_t delay_us = r.t_last_us - static_cast<uint32_t>(sent_us);
+  if (!has_delay_ref_) {
+    has_delay_ref_ = true;
+    delay_ref_ = delay_us;
+    delay_base_ms_ = rtt_ * 1000.0;
   }
-  if (accepted_ms) *accepted_ms = ms;
+  const double delay_ms = static_cast<int32_t>(delay_us - delay_ref_) / 1000.0;
+  delays_.push_back({sent_us, delay_ms});
+  while (sent_us - delays_.front().t_us > kFloorWindowUs) delays_.pop_front();
+  double delay_min = delay_ms;
+  for (const Sample& x : delays_) delay_min = std::min(delay_min, x.v);
+  const double ms = delay_base_ms_ + delay_ms - delay_min;
+  return queue_sample(sent_us + static_cast<int64_t>(ms * 1000.0), ms, queue, growth, sample_ms);
+}
+
+bool SignalMeter::queue_sample(int64_t t_us, double ms, double& queue, double& growth, double* sample_ms) {
+  // At most one sample per kSampleGapUs, and frames that arrive together —held up behind the same
+  // stall— are one sample, not several. At the frame rate, the growth over 50 ms would be read from
+  // intervals of a frame, and the swing of one frame's burst against the next became growth.
+  if (!raw_.empty() && t_us - raw_.back().t_us <= kSampleGapUs) return false;
   raw_.push_back({t_us, ms});
+  if (sample_ms) *sample_ms = ms;
   while (t_us - raw_.front().t_us > kFloorWindowUs) raw_.pop_front();
   update_noise(t_us);
   // The growth is that of the last two intervals between samples, the smaller (or that of the last,
@@ -481,9 +509,32 @@ bool SignalMeter::measure(int64_t now_us, Measurement& m) {
   // the control does with the one-way delay.
   double rtt_min = rtts_.front().v;
   for (const Sample& x : rtts_) rtt_min = std::min(rtt_min, x.v);
-  const double rise_ms = rtt_ * 1000.0 - rtt_min, upstream = upstream_ms(now_us);
-  const double rtt_video = upstream >= kUplinkShare * rise_ms
-      ? rtt_min / 1000.0 + std::max(0.0, rise_ms - upstream) / 1000.0 : rtt_;
+  double rise_ms = rtt_ * 1000.0 - rtt_min;
+  const double upstream = upstream_ms(now_us);
+  if (upstream >= kUplinkShare * rise_ms) rise_ms = std::max(0.0, rise_ms - upstream);
+  // ENet smooths the round trip by an eighth per ack, so after a stall that held the acks it stays
+  // above the floor for a while after the path is back. The delay of the frames that left since says
+  // whether there is a queue: the round trip crosses both ways, so it cannot have risen by more than
+  // twice what the video's delay did —a path that lengthens does exactly that—, and a stall, which
+  // leaves no queue behind, raises neither.
+  prune_floor(delays_);
+  if (!delays_.empty() && now_us - delays_.back().t_us <= kDelayFreshUs) {
+    double recent = delays_.back().v, delay_min = recent;
+    for (const Sample& x : delays_) {
+      delay_min = std::min(delay_min, x.v);
+      if (delays_.back().t_us - x.t_us <= kDelayRecentUs) recent = std::min(recent, x.v);
+    }
+    const double allowed = 2.0 * std::max(0.0, recent - delay_min);
+    // What the round trip rose and the video did not is a rise of the path that came back by itself:
+    // noise, for as long as ENet's smoothing takes to forget it.
+    if (rise_ms - allowed > kStallMinMs) {
+      stall_ms_ = rise_ms - allowed;
+      stall_us_ = now_us;
+    }
+    rise_ms = std::min(rise_ms, allowed);
+  }
+  if (now_us - stall_us_ < kStallHoldUs) m.noise = std::max(m.noise, stall_ms_ / 1000.0);
+  const double rtt_video = rtt_min / 1000.0 + rise_ms / 1000.0;
   m.owd_min = rtt_video;
   m.owd_mean = rtt_video;
   if (use_age_ && !ages_.empty()) {
