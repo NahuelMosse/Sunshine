@@ -29,85 +29,178 @@
 namespace abr {
 namespace gamestream {
 
-// What the host put on the wire for a frame. Host clock times, in µs.
+/**
+ * @brief What the host put on the wire for a frame. Host clock times, in µs.
+ */
 struct SentFrame {
-  uint32_t index = 0;
-  int64_t  t_first_us = 0;     // when the first packet went out
-  int64_t  t_last_us = 0;      // and the last
-  int      packets = 0;        // data and parity
-  int      data_packets = 0;   // of those, the data ones: the rest is the parity that went out
-  double   rtp_bytes = 0;      // what the client will count of those packets
-  double   wire_bytes = 0;     // that plus IP, UDP and encryption: what the bottleneck charges for
-  double   full_bytes = 0;     // in wire bytes, the size it would have had using the whole
-                               // budget (used only by the dispersion measurement)
+  uint32_t index = 0;  ///< frame index
+  int64_t  t_first_us = 0;  ///< when the first packet went out
+  int64_t  t_last_us = 0;  ///< and the last
+  int      packets = 0;  ///< data and parity
+  int      data_packets = 0;  ///< of those, the data ones: the rest is the parity that went out
+  double   rtp_bytes = 0;  ///< what the client will count of those packets
+  double   wire_bytes = 0;  ///< that plus IP, UDP and encryption: what the bottleneck charges for
+  /**
+   * @brief in wire bytes, the size it would have had using the whole budget (used only by the
+   *   dispersion measurement)
+   */
+  double   full_bytes = 0;
 };
 
-// The FEC status of a frame, as moonlight-common-c sends it (SS_FRAME_FEC_STATUS).
-// It only arrives for frames that needed parity or could not be reassembled. If it was reassembled, the
-// client sends it as soon as it gathers the data packets it needs: what was received is just that and
-// what has not arrived yet is not lost, so what is lost are the gaps behind the highest
-// received (missingPacketsBeforeHighestReceived; −1 if unknown).
+/**
+ * @brief The FEC status of a frame, as moonlight-common-c sends it (SS_FRAME_FEC_STATUS).
+ *
+ * It only arrives for frames that needed parity or could not be reassembled. If it was
+ * reassembled, the client sends it as soon as it gathers the data packets it needs: what was
+ * received is just that and what has not arrived yet is not lost, so what is lost are the gaps
+ * behind the highest received (missingPacketsBeforeHighestReceived; −1 if unknown).
+ */
 struct FecStatus {
-  uint32_t index = 0;
-  int data_total = 0, parity_total = 0;
-  int data_received = 0, parity_received = 0;
+  uint32_t index = 0;  ///< frame index
+  int data_total = 0;  ///< data packets the frame has
+  int parity_total = 0;  ///< parity packets the frame has
+  int data_received = 0;  ///< data packets that arrived
+  int parity_received = 0;  ///< parity packets that arrived
+  /**
+   * @brief missingPacketsBeforeHighestReceived: the gaps behind the highest received, -1 if
+   *   unknown
+   */
   int missing = -1;
 };
 
-// The arrival of a frame, as reported by GameStream's Frame Stats message (reserved in
-// all generations of the protocol and never implemented; its content is this one). CLIENT clock
-// times, truncated to 32 bits: they are never compared with the host's except by difference.
+/**
+ * @brief The arrival of a frame, as reported by GameStream's Frame Stats message.
+ *
+ * The message is reserved in all generations of the protocol and was never implemented; its
+ * content is this one. CLIENT clock times, truncated to 32 bits: they are never compared with the
+ * host's except by difference.
+ */
 struct ReceivedTrain {
-  uint32_t index = 0;
-  uint32_t t_first_us = 0;
-  uint32_t t_last_us = 0;
-  uint32_t bytes = 0;
-  uint16_t packets = 0;
+  uint32_t index = 0;  ///< frame index
+  uint32_t t_first_us = 0;  ///< client clock when the first packet arrived, in µs
+  uint32_t t_last_us = 0;  ///< client clock when the last packet arrived, in µs
+  uint32_t bytes = 0;  ///< bytes the frame had
+  uint16_t packets = 0;  ///< packets the frame had
 };
 
-// The periodic loss summary (IDX_LOSS_STATS): frames lost since the previous one and the
-// last one that arrived whole.
+/**
+ * @brief The periodic loss summary (IDX_LOSS_STATS): frames lost since the previous one and the
+ *   last one that arrived whole.
+ */
 struct LossSummary {
-  uint32_t lost = 0;
-  uint32_t last_good = 0;
+  uint32_t lost = 0;  ///< frames lost since the previous summary
+  uint32_t last_good = 0;  ///< index of the last frame that arrived whole
 };
 
+/**
+ * @brief Builds the controller's Measurement from the signals GameStream already carries.
+ */
 class SignalMeter {
  public:
   SignalMeter() = default;
 
+  /**
+   * @brief Record what the host put on the wire for a frame.
+   *
+   * @param c The frame.
+   */
   void sent(const SentFrame& c);
+
+  /**
+   * @brief Record the FEC status of a frame.
+   *
+   * @param e The status.
+   */
   void fec_status(const FecStatus& e);
+
+  /**
+   * @brief Record a loss summary.
+   *
+   * @param arrival_us Host clock when it arrived, in µs.
+   * @param r The summary.
+   */
   void summary(int64_t arrival_us, const LossSummary& r);
-  // The arrival of a frame (Frame Stats). With it the control measures the dispersion: how far the
-  // packets of a frame spread out when crossing the bottleneck, which gives the pipe's width
-  // even if the frame is small. A client that does not send it leaves the measurement as if without it.
-  // It also gives the video's one-way delay: the client clock at the first packet minus the host
-  // clock when it left. The clocks are not aligned, so only its rise over the ten-second minimum
-  // means anything: the queue in front of the video, without the uplink's part. Each frame is a
-  // sample placed where a ping sent along with it would have come back. Returns the queue over the
-  // floor and how much it grew since the sample 50 ms before, in seconds; false if there is nothing
-  // to compare with yet. See queue_sample.
-  // `sample_ms`, if given, gets the sample as a round trip in ms, or 0 if it was not taken.
+
+  /**
+   * @brief Record the arrival of a frame (Frame Stats).
+   *
+   * With it the control measures the dispersion: how far the packets of a frame spread out when
+   * crossing the bottleneck, which gives the pipe's width even if the frame is small. A client
+   * that does not send it leaves the measurement as if without it.
+   *
+   * It also gives the video's one-way delay: the client clock at the first packet minus the host
+   * clock when it left. The clocks are not aligned, so only its rise over the ten-second minimum
+   * means anything: the queue in front of the video, without the uplink's part. Each frame is a
+   * sample placed where a ping sent along with it would have come back.
+   *
+   * @param r The arrival.
+   * @param queue Receives the queue over the floor, in seconds.
+   * @param growth Receives how much the queue grew since the sample 50 ms before, in seconds.
+   * @param sample_ms If given, receives the sample as a round trip in ms, or 0 if it was not taken.
+   * @return False if there is nothing to compare with yet.
+   */
   bool train(const ReceivedTrain& r, double& queue, double& growth, double* sample_ms = nullptr);
+
+  /**
+   * @brief Record the arrival of a frame, without asking for the queue.
+   *
+   * @param r The arrival.
+   */
   void train(const ReceivedTrain& r) { double queue, growth; train(r, queue, growth); }
-  // ENet's round trip for the control channel's peer, in seconds, as the host reads it.
-  // One below half the floor is not a shorter path but a broken reading —on Windows a round trip of
-  // 1 ms shows up now and then—, and as a floor it poisons ten seconds of queue:
-  // it is discarded, unless it repeats, which is what a path that really got shorter would do.
+
+  /**
+   * @brief Record ENet's round trip for the control channel's peer, as the host reads it.
+   *
+   * One below half the floor is not a shorter path but a broken reading —on Windows a round trip
+   * of 1 ms shows up now and then—, and as a floor it poisons ten seconds of queue: it is
+   * discarded, unless it repeats, which is what a path that really got shorter would do.
+   *
+   * @param seconds The round trip, in seconds.
+   */
   void rtt(double seconds);
+
+  /**
+   * @brief Set the audio rate that goes out with the video.
+   *
+   * @param bps Bits/s on the wire.
+   */
   void audio(double bps) { audio_bps_ = bps; }
-  // The client asked for a keyframe, and the next frame to go out is `next_frame`. Until it
-  // arrives, the client discards the whole frames it receives —it has nothing to decode them from—
-  // and the summary counts them lost: those are not network loss, and do not enter the count.
+
+  /**
+   * @brief Record that the client asked for a keyframe.
+   *
+   * Until it arrives, the client discards the whole frames it receives —it has nothing to decode
+   * them from— and the summary counts them lost: those are not network loss, and do not enter the
+   * count.
+   *
+   * @param next_frame Index of the next frame to go out.
+   */
   void idr_request(uint32_t next_frame) { if (!idr_pending_) { idr_pending_ = true; idr_from_ = next_frame; } }
-  // The client's periodic ping, with its monotonic clock in milliseconds. How far its arrival
-  // drifts from that clock is the uplink's queue, which the summaries come back through.
+
+  /**
+   * @brief Record the client's periodic ping.
+   *
+   * How far its arrival drifts from the client's clock is the uplink's queue, which the summaries
+   * come back through.
+   *
+   * @param arrival_us Host clock when it arrived, in µs.
+   * @param client_ms The client's monotonic clock, in milliseconds.
+   */
   void client_ping(int64_t arrival_us, uint32_t client_ms);
-  // How much the queue rises and falls by itself, in seconds (Measurement::noise)
+
+  /**
+   * @brief How much the queue rises and falls by itself (Measurement::noise).
+   *
+   * @return Seconds.
+   */
   double noise() const { return noise_; }
-  // Which optional parts it uses: the queue from the age of the last good frame (queue_age) and what was
-  // delivered over the same frames (delivery_full > 0).
+
+  /**
+   * @brief Choose which optional parts the meter uses: the queue from the age of the last good
+   *   frame (`queue_age`) and what was delivered over the same frames (`delivery_full` > 0).
+   *
+   * @param p The parameters.
+   */
   void configure(const Params& p) {
     use_age_ = p.queue_age != 0;
     age_recent_us_ = static_cast<int64_t>(p.age_recent * 1e6);
@@ -118,12 +211,22 @@ class SignalMeter {
     prior_us_ = static_cast<int64_t>(p.alarm_prior_s * 1e6);
   }
 
-  // Builds the Measurement with what arrived since the previous call. Returns false if there is not yet
-  // anything to do it with: no round trip measured nor frames sent.
+  /**
+   * @brief Build the Measurement with what arrived since the previous call.
+   *
+   * @param now_us Host clock, in µs.
+   * @param m Receives the measurement.
+   * @return False if there is not yet anything to build it with: no round trip measured nor frames sent.
+   */
   bool measure(int64_t now_us, Measurement& m);
 
-  // Whether at least one loss summary arrived: with a stock client, what arrives is estimated
-  // instead of measured.
+  /**
+   * @brief Whether at least one loss summary arrived.
+   *
+   * With a stock client none does, and what arrives is estimated instead of measured.
+   *
+   * @return True if a summary arrived.
+   */
   bool has_summary() const { return had_summary_; }
 
  private:

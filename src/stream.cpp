@@ -504,7 +504,7 @@ namespace stream {
       int lowseq;
       // When this session's frames sent so far are paid for at its adaptive budget. Per session:
       // the broadcast thread serves every session, and one session's budget must not hold another's frames.
-      std::chrono::steady_clock::time_point paid_until;
+      std::chrono::steady_clock::time_point paid_until;  ///< When this session's frames sent so far are paid for at its budget.
       udp::endpoint peer;
 
       std::optional<crypto::cipher::gcm_t> cipher;
@@ -520,8 +520,8 @@ namespace stream {
 
       // With the adaptive controller pacing the session, its packets leave from a sender thread of
       // its own: paced on the shared thread, every session would wait on the others' pacing.
-      std::shared_ptr<safe::queue_t<video::packet_t>> packets;
-      std::jthread sender;
+      std::shared_ptr<safe::queue_t<video::packet_t>> packets;  ///< Queue the session's own sender thread takes packets from.
+      std::jthread sender;  ///< Sender thread of the session, when its video is paced by the controller.
     } video;  ///< Video worker thread state for the active stream.
 
     struct {

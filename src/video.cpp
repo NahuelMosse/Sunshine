@@ -544,6 +544,8 @@ namespace video {
      * FFmpeg's libx264 wrapper keeps the handle in its private context, right after its AVClass
      * pointer and the x264 parameters, and offers no way to invalidate references through
      * avcodec. The parameters must agree with the context for the handle to be trusted.
+     *
+     * @return The encoder handle, or null.
      */
     x264_t *x264_handle() const {
       if (!avcodec_ctx || !avcodec_ctx->codec || std::string_view {avcodec_ctx->codec->name} != "libx264"sv || !avcodec_ctx->priv_data) {

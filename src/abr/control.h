@@ -16,167 +16,332 @@
 
 namespace abr {
 
-// All the controller knows about the world. All of it arrives LATE: the client's report
-// also has to travel. That lateness is τ, and it sets the speed of the loop.
+/**
+ * @brief All the controller knows about the world.
+ *
+ * All of it arrives LATE: the client's report also has to travel. That lateness is τ, and it sets
+ * the speed of the loop.
+ */
 struct Measurement {
-  double t = 0;              // host time, seconds
-  double owd_min = 0;        // smallest one-way delay of the reported period
-  double owd_mean = 0;       // its average
-  double loss = 0;           // fraction of packets the client did not see
-  double rtt = 0;            // round trip, measured with an echo
-  double received_rate = 0;  // bits/s the client counted. The one that allows dropping to a
-                             // measured value instead of an invented fraction
-  double delivery = 0;       // for the same frames, how long they took to leave over how long they
-                             // took to arrive: below 1 is a pipe that slows them down. 0: unknown
-  int    samples = 0;        // how many packets back the above
+  double t = 0;  ///< host time, seconds
+  double owd_min = 0;  ///< smallest one-way delay of the reported period
+  double owd_mean = 0;  ///< its average
+  double loss = 0;  ///< fraction of packets the client did not see
+  double rtt = 0;  ///< round trip, measured with an echo
+  /**
+   * @brief bits/s the client counted. The one that allows dropping to a measured value instead
+   *   of an invented fraction
+   */
+  double received_rate = 0;
+  /**
+   * @brief for the same frames, how long they took to leave over how long they took to arrive:
+   *   below 1 is a pipe that slows them down. 0: unknown
+   */
+  double delivery = 0;
+  int    samples = 0;  ///< how many packets back the above
 
-  // What the host knows WITHOUT the client's help: how many bits it actually put on the wire.
-  // If that is far below the budget, the encoder had nothing to encode and the measurement
-  // just taken says nothing about the network.
+  /**
+   * @brief What the host knows WITHOUT the client's help: how many bits it actually put on the
+   *   wire. If that is far below the budget, the encoder had nothing to encode and the
+   *   measurement just taken says nothing about the network.
+   */
   double sent_rate = 0;
 
-  // The dispersion of the last frame's packet train, for the SQP variant:
-  // how many bytes it had and how long it took to cross, from its first packet to its last.
+  /**
+   * @brief The dispersion of the last frame's packet train, for the SQP variant: how many bytes
+   *   it had and how long it took to cross, from its first packet to its last.
+   */
   double train_bytes = 0;
-  double train_span = 0;     // T_end − T_start, measured at the client
-  double train_full_bytes = 0;  // the size that frame would have had without undershoot
-  // All the trains of the period, if whoever builds the Measurement has them; otherwise the one
-  // above stands. With only one per period you lose exactly the one that matters: the probe
-  // frame is almost never the last.
-  struct Train { double bytes = 0, span = 0; };
+  double train_span = 0;  ///< T_end − T_start, measured at the client
+  double train_full_bytes = 0;  ///< the size that frame would have had without undershoot
+  /**
+   * @brief The dispersion of one frame's packet train.
+   */
+  struct Train {
+    double bytes = 0;  ///< bytes the frame had
+    double span = 0;  ///< how long it took to cross, in seconds
+  };
+  /**
+   * @brief All the trains of the period, if whoever builds the Measurement has them; otherwise
+   *   `train_bytes` and `train_span` stand. With only one per period you lose exactly the one
+   *   that matters: the probe frame is almost never the last.
+   */
   std::vector<Train> trains;
-  // The parity that actually went out, over the data, in the last cycle. The host knows it
-  // without the client's help. With small frames it is not the requested one: the per-block minimum rules.
+  /**
+   * @brief The parity that actually went out, over the data, in the last cycle. The host knows
+   *   it without the client's help. With small frames it is not the requested one: the per-block
+   *   minimum rules.
+   */
   double parity_sent = 0;
-  // Lost packets per frame that lost any, in the period: the length of a burst.
-  // Zero if there was no loss or it is unknown.
+  /**
+   * @brief Lost packets per frame that lost any, in the period: the length of a burst. Zero if
+   *   there was no loss or it is unknown.
+   */
   double loss_burst = 0;
-  // How many reports arrived after their frame was already given up for lost, since startup.
-  // For the log only: if it grows, the blackout deadline is too short for this path.
+  /**
+   * @brief How many reports arrived after their frame was already given up for lost, since
+   *   startup. For the log only: if it grows, the blackout deadline is too short for this path.
+   */
   int late_reports = 0;
-  // What the encoder delivered, in bits/s of picture data —without parity or network
-  // headers—. Zero if unknown.
+  /**
+   * @brief What the encoder delivered, in bits/s of picture data —without parity or network
+   *   headers—. Zero if unknown.
+   */
   double data_rate = 0;
-  // How much the queue rises and falls by itself on a real path (Wi-Fi, internet), in seconds: it is not
-  // our own queue. Zero if unknown.
+  /**
+   * @brief How much the queue rises and falls by itself on a real path (Wi-Fi, internet), in
+   *   seconds: it is not our own queue. Zero if unknown.
+   */
   double noise = 0;
-  // The pipe that emptied the last queue, in bits/s: what the host sent between two round trips that
-  // found it full, over how long they took to come back. While there is a queue the bottleneck
-  // never idles, so that is what it delivers. Zero if no queue has emptied since the previous measurement.
+  /**
+   * @brief The pipe that emptied the last queue, in bits/s: what the host sent between two
+   *   round trips that found it full, over how long they took to come back. While there is a
+   *   queue the bottleneck never idles, so that is what it delivers. Zero if no queue has
+   *   emptied since the previous measurement.
+   */
   double drain_rate = 0;
-  double drain_start = 0;    // when that queue started to fill, host time in seconds
-  double drain_rise = 0;     // how long it took to reach its peak, in seconds
-  double drain_height = 0;   // and how far it rose by then, in seconds of queue
+  double drain_start = 0;  ///< when that queue started to fill, host time in seconds
+  double drain_rise = 0;  ///< how long it took to reach its peak, in seconds
+  double drain_height = 0;  ///< and how far it rose by then, in seconds of queue
 };
 
-// Why it moved. Without this, debugging the loop is guesswork (ch. 9).
+/**
+ * @brief Why the budget moved.
+ *
+ * Without this, debugging the loop is guesswork (ch. 9).
+ */
 enum class Reason {
-  startup,
-  steady,           // on target, nothing new
-  no_evidence,      // the encoder did not fill the budget: the sample says nothing
-  queue_growing,    // the growth term took over
-  queue_high,       // the level corrector
-  loss_backoff,     // overflow: high loss with a full queue
-  ramping,          // climbing along the S curve
-  reanchored,       // lowering did not help: it was not a queue
-  probing,          // deliberate cut to re-read the floor
-  capped,
+  startup,  ///< the first steps of the session
+  steady,  ///< on target, nothing new
+  no_evidence,  ///< the encoder did not fill the budget: the sample says nothing
+  queue_growing,  ///< the growth term took over
+  queue_high,  ///< the level corrector
+  loss_backoff,  ///< overflow: high loss with a full queue
+  ramping,  ///< climbing along the S curve
+  reanchored,  ///< lowering did not help: it was not a queue
+  probing,  ///< deliberate cut to re-read the floor
+  capped,  ///< the budget ran into the bitrate bounds or the proven ceiling
 };
 
+/**
+ * @brief Name of a reason.
+ *
+ * @param m The reason.
+ * @return The name the reason goes by in logs.
+ */
 const char* name(Reason m);
 
-// The decision, plus everything chapter 9 says to record. The audit fields are not
-// optional: retuning is the first thing to break, and without seeing it you do not notice.
+/**
+ * @brief The decision, plus everything chapter 9 says to record.
+ *
+ * The audit fields are not optional: retuning is the first thing to break, and without seeing it
+ * you do not notice.
+ */
 struct Decision {
-  double budget = 0;         // bits/s on the wire, whole
-  double video_rate = 0;     // of that, what is left for the picture
-  // What to ask the encoder for so that it delivers `video_rate`. It is the picture rate divided
-  // by what the encoder has been delivering of what it is asked (see
-  // `encoder_compensation_max`); without compensation, equal to `video_rate`.
+  double budget = 0;  ///< bits/s on the wire, whole
+  double video_rate = 0;  ///< of that, what is left for the picture
+  /**
+   * @brief What to ask the encoder for so that it delivers `video_rate`. It is the picture rate
+   *   divided by what the encoder has been delivering of what it is asked (see
+   *   `encoder_compensation_max`); without compensation, equal to `video_rate`.
+   */
   double encoder_request = 0;
-  double repair = 0;         // fraction of parity
-  Reason reason = Reason::startup;
-  bool   app_limited = false;   // the encoder is not using the budget
-  double train_bandwidth = 0;   // the dispersion estimate, if the variant uses it
+  double repair = 0;  ///< fraction of parity
+  Reason reason = Reason::startup;  ///< why the budget moved
+  bool   app_limited = false;  ///< the encoder is not using the budget
+  double train_bandwidth = 0;  ///< the dispersion estimate, if the variant uses it
 
-  double queue = 0;          // what the controller believes the queue to be
-  double delay_floor = 0;    // the reference it computed it against
-  double dref = 0;           // and the current target
-  double growth = 0;         // the per-cycle derivative, already filtered
-  double dead_zone = 0;      // the yardstick the level is measured with
-  double C_est = 0;          // estimated capacity
-  double tau_est = 0;        // estimated dead time
-  double kg = 0, kp = 0;     // the gains that came out of the two above
-  double loss_est = 0;
-  double loss_burst = 1;       // packets each stumble takes away, for the parity
-  int    min_parity = 2;       // the minimum parity per block (fec_min_clean)
-  int    samples = 0;        // how much evidence the decision rested on
-  bool   probing = false;
-  bool   reanchored = false;
-  bool   capped = false;
+  double queue = 0;  ///< what the controller believes the queue to be
+  double delay_floor = 0;  ///< the reference it computed it against
+  double dref = 0;  ///< and the current target
+  double growth = 0;  ///< the per-cycle derivative, already filtered
+  double dead_zone = 0;  ///< the yardstick the level is measured with
+  double C_est = 0;  ///< estimated capacity
+  double tau_est = 0;  ///< estimated dead time
+  double kg = 0;  ///< gain on the queue growth, derived from C_est and tau_est
+  double kp = 0;  ///< gain on the queue level, derived from C_est and tau_est
+  double loss_est = 0;  ///< the loss the repair is decided with
+  double loss_burst = 1;  ///< packets each stumble takes away, for the parity
+  int    min_parity = 2;  ///< the minimum parity per block (fec_min_clean)
+  int    samples = 0;  ///< how much evidence the decision rested on
+  bool   probing = false;  ///< a deliberate cut to re-read the delay floor is under way
+  bool   reanchored = false;  ///< the ramp-up curve was moved to a new anchor in this step
+  bool   capped = false;  ///< the budget ran into the bitrate bounds or the proven ceiling
 };
 
-// How many parity packets a block of k data packets carries when the repair is decided in
-// packets (`parity_in_packets`). It is the smallest m —with the minimum the client asks for— that keeps
-// the probability of losing the block below `parity_block_failure`, if the loss is
-// `loss` and arrives in stumbles of `burst` consecutive packets: stumbles start with
-// probability loss/burst per packet, and the block withstands as many as fit in its parity.
-//
-// Capped by `fec_max`. Without the cap, the loss of an overflowing queue —congestion loss— is
-// answered with more parity, and that adds load to the pipe that is failing. Telling the
-// overflow apart by the queue is not enough: with a download in the pipe the delay floor
-// is poisoned and the queue looks low.
-//
-// The host calls it for each block, with `loss_est`, `loss_burst` and `min_parity` of the
-// last decision; a negative `minimum` means `fec_min_packets`.
+/**
+ * @brief How many parity packets a block of k data packets carries when the repair is decided in
+ *   packets (`parity_in_packets`).
+ *
+ * It is the smallest m —with the minimum the client asks for— that keeps the probability of
+ * losing the block below `parity_block_failure`, if the loss is `loss` and arrives in stumbles of
+ * `burst` consecutive packets: stumbles start with probability loss/burst per packet, and the
+ * block withstands as many as fit in its parity.
+ *
+ * Capped by `fec_max`. Without the cap, the loss of an overflowing queue —congestion loss— is
+ * answered with more parity, and that adds load to the pipe that is failing. Telling the overflow
+ * apart by the queue is not enough: with a download in the pipe the delay floor is poisoned and
+ * the queue looks low.
+ *
+ * The host calls it for each block, with `loss_est`, `loss_burst` and `min_parity` of the last
+ * decision.
+ *
+ * @param k Data packets in the block.
+ * @param loss Estimated loss fraction.
+ * @param burst Consecutive packets each loss stumble takes away.
+ * @param p The parameters.
+ * @param minimum Minimum parity packets; a negative value means `fec_min_packets`.
+ * @return Parity packets for the block.
+ */
 int block_parity(int k, double loss, double burst, const Params& p, int minimum = -1);
 
+/**
+ * @brief The bitrate controller: a measurement comes in, a decision comes out.
+ */
 class Control {
  public:
+  /**
+   * @brief Create a controller.
+   *
+   * @param p The parameters.
+   */
   explicit Control(const Params& p);
 
-  // Leaves the loop as freshly started. `negotiated` is the ceiling the client asked for.
+  /**
+   * @brief Leave the loop as freshly started.
+   *
+   * @param negotiated The ceiling the client asked for, in bits/s.
+   */
   void reset(double negotiated);
 
-  // Called every Tc with the latest that arrived from the client.
+  /**
+   * @brief Take one step of the loop. Called every Tc with the latest that arrived from the client.
+   *
+   * @param m The latest measurement.
+   * @return The decision, with the audit fields.
+   */
   Decision step(const Measurement& m);
 
-  // Between two steps, with each round-trip sample: that sample's queue over its floor and
-  // how much it grew in the last 50 ms, in seconds, and the latest measured delivery. If the
-  // queue jumped by a step only a narrow pipe explains, it cuts the budget right there —without
-  // waiting for the step— and returns true; the new budget is the one from budget().
+  /**
+   * @brief Check a round-trip sample between two steps.
+   *
+   * If the queue jumped by a step only a narrow pipe explains, the budget is cut right there
+   * —without waiting for the step— and the new budget is the one from budget().
+   *
+   * @param t Host time, in seconds.
+   * @param queue The sample's queue over its floor, in seconds.
+   * @param growth How much the queue grew in the last 50 ms, in seconds.
+   * @param received The latest measured delivery.
+   * @return True if the alarm fired.
+   */
   bool alarm(double t, double queue, double growth, double received);
-  // With the sample following an alarm: if the queue is already back at its floor, the step was a
-  // delayed ack and not a narrowing pipe —the queue of a narrow pipe does not empty in one sample—, and
-  // the loop returns to how it was before the alarm. Returns true if it undid it; the budget
-  // goes back to being the one from budget().
+
+  /**
+   * @brief Check the sample following an alarm.
+   *
+   * If the queue is already back at its floor, the step was a delayed ack and not a narrowing
+   * pipe —the queue of a narrow pipe does not empty in one sample—, and the loop returns to how it
+   * was before the alarm. The budget goes back to being the one from budget().
+   *
+   * @param t Host time, in seconds.
+   * @param queue The sample's queue over its floor, in seconds.
+   * @return True if the alarm was undone.
+   */
   bool retract_alarm(double t, double queue);
-  double budget() const { return R_ * p_.utilization; }
-  // Whether the alarm also asks for a keyframe right away (keyframe_on_drop). With a narrow
-  // pipe, what left in the last hundred milliseconds is being lost, and the client notices it
-  // only when the first whole frame reaches it, a third of a second later; from then on it
-  // discards everything up to the keyframe it asks for. Sending it now makes that first frame be it.
-  bool alarm_requests_keyframe() const { return p_.keyframe_on_drop != 0; }
-  // The current minimum parity per block; the alarm raises it again right away.
-  int min_parity() const { return min_parity_; }
-  // The frames per second the host actually encodes (frames_in_flight): the minimum parity is
-  // a per-frame cost, and counting it at the nominal rate left the picture on the floor.
-  void set_fps(double fps) { fps_ = fps > 0 ? fps : p_.fps; }
 
-  // For the ultimate-gain experiment: multiplies k_g and k_p by the same factor.
-  // The model predicts the loop starts to oscillate steadily at a
-  // specific value — it is the prediction that can kill it.
-  void scale_gains(double factor) { scale_ = factor; }
+  /**
+   * @brief The budget the loop currently allows.
+   *
+   * @return Bits/s on the wire, after the utilization.
+   */
+  double budget() const {
+    return R_ * p_.utilization;
+  }
 
-  // For the estimation-error experiment: forces Ĉ instead of deducing it.
-  void force_capacity(double bps) { C_forced_ = bps; }
+  /**
+   * @brief Whether the alarm also asks for a keyframe right away (`keyframe_on_drop`).
+   *
+   * With a narrow pipe, what left in the last hundred milliseconds is being lost, and the client
+   * notices it only when the first whole frame reaches it, a third of a second later; from then
+   * on it discards everything up to the keyframe it asks for. Sending it now makes that first
+   * frame be it.
+   *
+   * @return True if the keyframe is asked for.
+   */
+  bool alarm_requests_keyframe() const {
+    return p_.keyframe_on_drop != 0;
+  }
 
-  // Naive mode: no growth term, with fixed gains. It is chapter 4's counterfactual
-  // — two integrations without a derivative.
-  void naive_mode(bool on) { naive_ = on; }
+  /**
+   * @brief The current minimum parity per block; the alarm raises it again right away.
+   *
+   * @return Parity packets per block.
+   */
+  int min_parity() const {
+    return min_parity_;
+  }
 
-  const Params& params() const { return p_; }
-  const Tuning&   tuning() const { return s_; }
+  /**
+   * @brief Set the frames per second the host actually encodes (`frames_in_flight`).
+   *
+   * The minimum parity is a per-frame cost, and counting it at the nominal rate left the picture
+   * on the floor.
+   *
+   * @param fps Frames per second; a value that is not positive restores the nominal rate.
+   */
+  void set_fps(double fps) {
+    fps_ = fps > 0 ? fps : p_.fps;
+  }
+
+  /**
+   * @brief Multiply k_g and k_p by the same factor, for the ultimate-gain experiment.
+   *
+   * The model predicts the loop starts to oscillate steadily at a specific value: it is the
+   * prediction that can kill it.
+   *
+   * @param factor The factor.
+   */
+  void scale_gains(double factor) {
+    scale_ = factor;
+  }
+
+  /**
+   * @brief Force Ĉ instead of deducing it, for the estimation-error experiment.
+   *
+   * @param bps The capacity, in bits/s.
+   */
+  void force_capacity(double bps) {
+    C_forced_ = bps;
+  }
+
+  /**
+   * @brief Turn naive mode on or off: no growth term, with fixed gains.
+   *
+   * It is chapter 4's counterfactual: two integrations without a derivative.
+   *
+   * @param on Whether naive mode is on.
+   */
+  void naive_mode(bool on) {
+    naive_ = on;
+  }
+
+  /**
+   * @brief The parameters the controller runs with.
+   *
+   * @return The parameters.
+   */
+  const Params& params() const {
+    return p_;
+  }
+
+  /**
+   * @brief The gains derived from the parameters.
+   *
+   * @return The gains.
+   */
+  const Tuning& tuning() const {
+    return s_;
+  }
 
  private:
   struct Sample { double t = 0; double v = 0; };

@@ -65,8 +65,13 @@ namespace adaptive_bitrate {
 
     /**
      * @brief Record a frame that just left the host.
+     * @param frame_index Index of the frame.
+     * @param first When its first packet left.
+     * @param last When its last packet left.
      * @param packets Data and parity packets of the frame.
      * @param data_packets Of those, the data packets; the rest is the parity that went out.
+     * @param rtp_bytes Bytes the client counts of its packets.
+     * @param wire_bytes Bytes it costs on the wire, with IP, UDP and encryption.
      */
     void frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes);
 
@@ -117,6 +122,8 @@ namespace adaptive_bitrate {
      * the loss stats travel through: the meter takes it out of how old the last good frame is.
      * A client that leaves the timestamp at zero is simply not used.
      *
+     * @param now When the ping arrived.
+     * @param payload Message payload as received on the control stream.
      * @return False if the payload is too short.
      */
     bool client_ping(std::chrono::steady_clock::time_point now, std::string_view payload);
@@ -129,6 +136,8 @@ namespace adaptive_bitrate {
      * then on it drops everything until the key frame it asks for. Sending one right away makes
      * that first whole frame the key frame. Deciding to send a key frame is the host's call: the
      * protocol carries it as it carries any other.
+     *
+     * @return True once when a key frame should be sent, then false until the controller asks again.
      */
     bool take_idr_request() {
       return idr_wanted.exchange(false, std::memory_order_relaxed);
@@ -146,6 +155,8 @@ namespace adaptive_bitrate {
      * with a long queue fewer frames are encoded, and the client sees a lower frame rate, as it
      * does whenever the screen is still. And with an encoder that keeps its bitrate
      * (encoder_bitrate_fixed) the share of frames is what carries the budget.
+     *
+     * @return Frames to encode per thousand captured, or 0 if nothing changed.
      */
     int take_frame_divider() {
       return divider_changed.exchange(0, std::memory_order_relaxed);
@@ -169,9 +180,16 @@ namespace adaptive_bitrate {
      * It keeps asking, from the same first frame, while it finds more frames lost behind it; each
      * time the encoder must still hold the frame before that one. From the first request on, fewer
      * frames are encoded for a while (`alarm_frame_divisor`), as after an alarm.
+     *
+     * @param now When the request arrived.
      */
     void invalidation_requested(std::chrono::steady_clock::time_point now);
 
+    /**
+     * @brief The video queue the controller currently estimates.
+     *
+     * @return Seconds.
+     */
     double queue_s() const {
       return queue.load(std::memory_order_relaxed);
     }
@@ -215,6 +233,7 @@ namespace adaptive_bitrate {
      * would stay at whatever it was when the session started.
      *
      * @param now Current time.
+     * @return True if a ping is due.
      */
     bool enet_ping_due(std::chrono::steady_clock::time_point now);
 
@@ -232,6 +251,7 @@ namespace adaptive_bitrate {
      * `block_fec_percentage()`.
      *
      * @param configured The percentage from the configuration.
+     * @return The percentage to use.
      */
     int fec_percentage(int configured) const;
 
@@ -259,6 +279,7 @@ namespace adaptive_bitrate {
      * sees loss or a queue step.
      *
      * @param requested The minimum the client asked for.
+     * @return Parity packets per block: `requested`, or fewer if the controller allows it.
      */
     int min_parity(int requested) const {
       if ((mode != mode_e::fec && mode != mode_e::full) || !active()) {
@@ -272,6 +293,8 @@ namespace adaptive_bitrate {
      *
      * This is the image budget: what is left of the total budget after FEC and audio. It is
      * 0 until the first controller step.
+     *
+     * @return Kilobits per second.
      */
     int target_bitrate_kbps() const {
       return target_kbps.load(std::memory_order_relaxed);
@@ -283,6 +306,8 @@ namespace adaptive_bitrate {
      * The image part of the starting budget, pushed to the encoder as soon as the controller takes
      * over (active()), so the frames do not keep going out at the client's full bitrate before it
      * has measured anything. Only meaningful in full mode.
+     *
+     * @return Kilobits per second.
      */
     int initial_encoder_kbps() const {
       return initial_kbps;
@@ -296,6 +321,8 @@ namespace adaptive_bitrate {
      * keeps full, a burst loses a run of consecutive packets that no parity can repair; spread
      * out, the losses are scattered and the block parity covers them. Only in full mode, and 0
      * until the first controller step, which means the stream's default pacing.
+     *
+     * @return Bits per second, or 0 for the stream's default pacing.
      */
     double pacing_bps() const {
       return mode == mode_e::full ? pacing.load(std::memory_order_relaxed) : 0.0;
@@ -309,6 +336,8 @@ namespace adaptive_bitrate {
      * controller the loss of whole frames and the queue of each direction. Until one of those
      * arrives the stream runs as without the controller: the client's bitrate, the configured FEC
      * and the default pacing.
+     *
+     * @return True once the client has sent one of those.
      */
     bool active() const {
       return active_signals.load(std::memory_order_relaxed);
@@ -316,6 +345,8 @@ namespace adaptive_bitrate {
 
     /**
      * @brief Whether the controller may pace the stream's frames, which is only in full mode.
+     *
+     * @return True in full mode.
      */
     bool paces() const {
       return mode == mode_e::full;
@@ -329,6 +360,8 @@ namespace adaptive_bitrate {
      * frames larger than that —encoded for the budget before the last cut, or an encoder
      * overshooting at a scene change— wait on the host instead of flooding the path's queue.
      * Only in full mode, and 0 means no limit.
+     *
+     * @return Bits per second, or 0 for no limit.
      */
     double budget_bps() const {
       return mode == mode_e::full ? budget.load(std::memory_order_relaxed) : 0.0;
