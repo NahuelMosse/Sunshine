@@ -772,3 +772,38 @@ TEST_F(Libx264SessionTest, AppliesTheBitrateTheControllerAsksFor) {
   video::apply_requested_bitrate(*session, events, fixed, reported);
   EXPECT_FALSE(fixed->peek());
 }
+
+TEST_F(Libx264SessionTest, TheAdaptiveModesKeepOlderReferencesForTheClientsRepairRequests) {
+  const auto saved = config::stream.adaptive_bitrate;
+  config::stream.adaptive_bitrate = "fec";
+  // The client set no reference limit: the adaptive controller makes sure there are enough of them
+  open(0);
+  config::stream.adaptive_bitrate = saved;
+
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 9; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+  session->invalidate_ref_frames(9, 10);
+  auto repaired = encode_next();
+  ASSERT_TRUE(repaired);
+  EXPECT_FALSE(repaired->is_idr());
+  EXPECT_TRUE(repaired->after_ref_frame_invalidation);
+}
+
+TEST_F(Libx264SessionTest, WithoutTheAdaptiveModesNoReferencesAreAdded) {
+  const auto saved = config::stream.adaptive_bitrate;
+  config::stream.adaptive_bitrate = "disabled";
+  open(0);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+  session->invalidate_ref_frames(5, 6);
+  auto repaired = encode_next();
+  EXPECT_TRUE(repaired) << "whatever libx264 keeps by default, the frame that follows decodes";
+  config::stream.adaptive_bitrate = saved;
+}
