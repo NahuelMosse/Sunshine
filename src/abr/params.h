@@ -95,8 +95,7 @@ struct Params {
   double noise_filter = 0.75;       // s: the window of the queue fit on a noisy path
   // A queue that emptied in less than this, with a pipe that delivers what was being sent before
   // it, was an air outage and not a narrower pipe: the budget goes back to what it was.
-  // 0 turns it off, and it is off: the bench could not tell it apart from noise between runs. With 1.5 s,
-  // through SUNSHINE_ESTAB_PARAMS, to try it on a real path.
+  // 0 turns it off, and it is off: the bench could not tell it apart from noise between runs.
   double drain_episode = 0;         // s
   // How much the queue has to rise per second for the queue to be that of an air outage and not the
   // loop's own
