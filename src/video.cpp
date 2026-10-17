@@ -23,6 +23,8 @@ extern "C" {
   #include <ffnvcodec/nvEncodeAPI.h>
 #endif
 }
+#include <cstdint>
+#include <x264.h>
 
 // local includes
 #include "cbs.h"
@@ -524,9 +526,55 @@ namespace video {
      * @param last_frame Last frame.
      */
     void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) override {
-      BOOST_LOG(error) << "Encoder doesn't support reference frame invalidation";
-      request_idr_frame();
+      if (!x264_handle()) {
+        BOOST_LOG(error) << "Encoder doesn't support reference frame invalidation";
+        request_idr_frame();
+        return;
+      }
+      // The client keeps asking from the same first frame while it finds more frames lost behind
+      // it, frames that were already in flight when the first request was handled. As with NVENC,
+      // the range done reaches the last frame encoded then, and what falls inside it is done:
+      // invalidating again would also drop the frames predicted since from an older reference.
+      if (first_frame >= rfi_range.first && last_frame <= rfi_range.second) {
+        return;
+      }
+      const auto from = first_frame >= rfi_range.first && first_frame <= rfi_range.second ? rfi_range.second + 1 : first_frame;
+      rfi_range = {first_frame, std::max(last_frame, last_encoded_frame)};
+      // Applied right before the next frame goes to the encoder, on the encoding thread
+      pending_invalidation = pending_invalidation < 0 ? from : std::min(pending_invalidation, from);
     }
+
+    /**
+     * @brief The libx264 encoder behind the FFmpeg context, or null for any other encoder.
+     *
+     * FFmpeg's libx264 wrapper keeps the handle in its private context, right after its AVClass
+     * pointer and the x264 parameters, and offers no way to invalidate references through
+     * avcodec. The parameters must agree with the context for the handle to be trusted.
+     *
+     * @return The encoder handle, or null.
+     */
+    x264_t *x264_handle() const {
+      if (!avcodec_ctx || !avcodec_ctx->codec || std::string_view {avcodec_ctx->codec->name} != "libx264"sv || !avcodec_ctx->priv_data) {
+        return nullptr;
+      }
+
+      struct x264_context_prefix {
+        const AVClass *av_class;
+        x264_param_t params;
+        x264_t *enc;
+      };
+
+      const auto *priv = static_cast<const x264_context_prefix *>(avcodec_ctx->priv_data);
+      if (priv->params.i_width != avcodec_ctx->width || priv->params.i_height != avcodec_ctx->height || priv->params.i_frame_reference < 2) {
+        return nullptr;
+      }
+      return priv->enc;
+    }
+
+    int64_t pending_invalidation = -1;  ///< First frame whose references the client lost, if any.
+    std::pair<int64_t, int64_t> rfi_range {-1, -1};  ///< The frames already invalidated.
+    int64_t last_encoded_frame = -1;  ///< The last frame handed to the encoder.
+    bool mark_after_invalidation = false;  ///< Whether the next frame out is the one that follows it.
 
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
@@ -1224,7 +1272,7 @@ namespace video {
       "libx264"s,
       {},  // capabilities
     },
-    H264_ONLY | PARALLEL_ENCODING | ALWAYS_REPROBE | YUV444_SUPPORT
+    H264_ONLY | PARALLEL_ENCODING | ALWAYS_REPROBE | YUV444_SUPPORT | REF_FRAMES_INVALIDATION
   };
 
 #if defined(__linux__) || defined(linux) || defined(__linux) || defined(__FreeBSD__)
@@ -1836,7 +1884,21 @@ namespace video {
     auto &sps = session.sps;
     auto &vps = session.vps;
 
+    // The client lost frames and asked to stop referencing them: libx264 drops them from its
+    // references, and this frame is predicted from an older one the client still has
+    if (session.pending_invalidation >= 0) {
+      auto *x264 = session.x264_handle();
+      const int result = x264 ? x264_encoder_invalidate_reference(x264, session.pending_invalidation) : -1;
+      if (result == 0) {
+        session.mark_after_invalidation = true;
+      } else {
+        session.request_idr_frame();
+      }
+      session.pending_invalidation = -1;
+    }
+
     // send the frame to the encoder
+    session.last_encoded_frame = frame_nr;
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
       std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
@@ -1891,6 +1953,10 @@ namespace video {
 
       if (av_packet && av_packet->pts == frame_nr) {
         packet->frame_timestamp = frame_timestamp;
+        if (session.mark_after_invalidation) {
+          packet->after_ref_frame_invalidation = !(av_packet->flags & AV_PKT_FLAG_KEY);
+          session.mark_after_invalidation = false;
+        }
       }
 
       packet->replacements = &session.replacements;
