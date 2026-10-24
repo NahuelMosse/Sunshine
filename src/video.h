@@ -69,6 +69,16 @@ namespace video {
   int select_h264_profile(std::string_view encoder_name, const config_t &config, int amd_coder);
 
   /**
+   * @brief Whether the chosen encoder changes its bitrate during the session without resetting.
+   *
+   * Only NVENC on Windows and libx264 do. The others keep the bitrate they are opened with.
+   *
+   * @param video_format 0 for H.264, 1 for HEVC, 2 for AV1.
+   * @return True when the bitrate can follow the controller.
+   */
+  bool changes_bitrate_in_place(int video_format);
+
+  /**
    * @brief Map an FFmpeg hardware device type to Sunshine's memory type.
    *
    * @param type FFmpeg hardware device type reported by the encoder backend.

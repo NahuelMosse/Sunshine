@@ -50,6 +50,14 @@ namespace video {
 
   namespace {
     /**
+     * @brief Whether the adaptive bitrate controller repairs losses by invalidating references.
+     * @return True in the adaptive bitrate modes that act on the stream.
+     */
+    bool adaptive_repairs() {
+      return config::stream.adaptive_bitrate == "fec" || config::stream.adaptive_bitrate == "full";
+    }
+
+    /**
      * @brief Check if we can allow probing for the encoders.
      * @return True if there should be no issues with the probing, false if we should prevent it.
      */
@@ -1575,6 +1583,22 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+
+  bool changes_bitrate_in_place(int video_format) {
+    if (!chosen_encoder) {
+      return false;
+    }
+#ifdef _WIN32
+    // The standalone NVENC encoder; on Linux the encoder of this name is FFmpeg's, which resets
+    if (chosen_encoder->name == "nvenc"sv) {
+      return true;
+    }
+#endif
+    const auto &codec = video_format == 2 ? chosen_encoder->av1 : video_format == 1 ? chosen_encoder->hevc :
+                                                                                      chosen_encoder->h264;
+    return codec.name == "libx264"sv;
+  }
+
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
@@ -2199,6 +2223,10 @@ namespace video {
         } else {
           BOOST_LOG(warning) << "Client requested reference frame limit, but encoder doesn't support it!"sv;
         }
+      } else if (adaptive_repairs() && std::string_view {codec->name} == "libx264"sv) {
+        // libx264 invalidates references by no longer using them, so it needs older ones to
+        // predict from; with a single reference every lost frame would cost an IDR frame
+        ctx->refs = 4;
       }
 
       // We forcefully reset the flags to avoid clash on reuse of AVCodecContext
@@ -2375,6 +2403,13 @@ namespace video {
 
       // Allow the encoding device a final opportunity to set/unset or override any options
       encode_device->init_codec_options(ctx.get(), &options);
+
+      // Keep the frames sent over the last round trip decodable as references, so that after a
+      // loss the next frame can be predicted from one the client still has
+      if (adaptive_repairs() && ctx->refs > 1 && std::string_view {codec->name} == "libx264"sv) {
+        auto *existing = av_dict_get(options, "x264-params", nullptr, 0);
+        av_dict_set(&options, "x264-params", existing ? ":dpb-size=16" : "dpb-size=16", existing ? AV_DICT_APPEND : 0);
+      }
 
       if (auto status = avcodec_open2(ctx.get(), codec, &options)) {
         std::array<char, AV_ERROR_MAX_STRING_SIZE> err_str {0};
