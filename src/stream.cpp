@@ -503,6 +503,7 @@ namespace stream {
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
+    std::chrono::steady_clock::time_point video_epoch;  ///< Origin of the RTP timestamps of every video sender.
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
@@ -546,6 +547,11 @@ namespace stream {
       safe::mail_raw_t::event_t<int> frame_divider_events;  ///< Event carrying the share of captured frames to encode, in thousandths.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
+
+      // With the adaptive controller pacing the session, its packets leave from a sender thread of
+      // its own: paced on the shared thread, every session would wait on the others' pacing.
+      std::shared_ptr<safe::queue_t<video::packet_t>> packets;  ///< Queue the session's own sender thread takes packets from.
+      std::jthread sender;  ///< Sender thread of the session, when its video is paced by the controller.
     } video;  ///< Video worker thread state for the active stream.
 
     struct {
@@ -1622,17 +1628,22 @@ namespace stream {
   }
 
   /**
-   * @brief Run the broadcast video sender thread.
+   * @brief Run a video sender thread.
+   *
+   * The broadcast sender takes the packets of every session and sends them, except for the
+   * sessions with a sender of their own, whose packets it hands over to that sender's queue.
    *
    * @param sock Socket used to read or write the protocol message.
+   * @param video_epoch Origin of the RTP timestamps.
+   * @param own_packets Queue of the one session this thread sends for, or nullptr for the broadcast sender.
    */
-  void videoBroadcastThread(udp::socket &sock) {
+  void videoSendThread(udp::socket &sock, std::chrono::steady_clock::time_point video_epoch, std::shared_ptr<safe::queue_t<video::packet_t>> own_packets) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
+    const bool broadcast = !own_packets;
+    std::shared_ptr<safe::queue_t<video::packet_t>> packets = broadcast ? mail::man->queue<video::packet_t>(mail::video_packets) : own_packets;
 
     // Video traffic is sent on this thread
-    platf::set_thread_name("stream::videoBroadcast");
+    platf::set_thread_name(broadcast ? "stream::videoBroadcast" : "stream::videoSend");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
     logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
@@ -1656,9 +1667,14 @@ namespace stream {
         break;
       }
 
+      auto *session = packet->channel_data;
+      if (broadcast && session->video.packets) {
+        session->video.packets->raise(std::move(packet));
+        continue;
+      }
+
       frame_network_latency_logger.first_point_now();
 
-      auto *session = packet->channel_data;
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -2019,7 +2035,10 @@ namespace stream {
       }
     }
 
-    shutdown_event->raise(true);
+    // A session's sender ends with its session; only the broadcast sender ending brings the broadcast down
+    if (broadcast) {
+      shutdown_event->raise(true);
+    }
   }
 
   /**
@@ -2193,7 +2212,8 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
-    ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_epoch = std::chrono::steady_clock::now();
+    ctx.video_thread = std::jthread {videoSendThread, std::ref(ctx.video_sock), ctx.video_epoch, nullptr};
     ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
 
@@ -2326,6 +2346,12 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
+    // Before the first frame is encoded, so the broadcast sender already finds the session's queue
+    if (session->adaptive && session->adaptive->paces()) {
+      session->video.packets = std::make_shared<safe::queue_t<video::packet_t>>(32);
+      session->video.sender = std::jthread {videoSendThread, std::ref(ref->video_sock), ref->video_epoch, session->video.packets};
+    }
+
     BOOST_LOG(debug) << "Start capturing Video"sv;
     video::capture(session->mail, session->config.monitor, session);
   }
@@ -2408,6 +2434,10 @@ namespace stream {
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
+      if (session.video.packets) {
+        session.video.packets->stop();
+        session.video.sender.join();
+      }
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
