@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <variant>
 
 // local includes
@@ -153,6 +154,8 @@ namespace NVENC_NAMESPACE {
       NV_ENC_BUFFER_FORMAT buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
       uint32_t ref_frames_in_dpb = 0;
       bool rfi = false;
+      int video_format = 0;  ///< 0 H.264, 1 HEVC, 2 AV1.
+      uint32_t ltr_frames = 0;  ///< Long-term reference slots kept for repairs, 0 without them.
     } encoder_params;  ///< Current encoder dimensions, pixel format, and reference-frame settings.
 
     std::string last_nvenc_error_string;  ///< Last NVENC error string.
@@ -230,6 +233,26 @@ namespace NVENC_NAMESPACE {
       const GUID &encode_guid
     );
 
+    /**
+     * @brief Keep long-term reference slots for repairs, with the adaptive bitrate controller.
+     *
+     * @tparam FormatConfig Codec-specific NVENC configuration type.
+     * @param format_config Codec-specific encoder configuration to update.
+     * @param encode_guid Selected codec GUID.
+     */
+    template<typename FormatConfig>
+    void configure_long_term_references(FormatConfig &format_config, const GUID &encode_guid);
+
+    /**
+     * @brief Configure VUI metadata and intra-refresh options shared by H.264 and HEVC.
+     *
+     * @tparam FormatConfig Codec-specific NVENC configuration type.
+     * @param format_config Codec-specific encoder configuration to update.
+     * @param client_config Stream configuration requested by the client.
+     * @param colorspace NVENC colorspace metadata.
+     * @param buffer_format Selected NVENC input format.
+     * @param encode_guid Selected codec GUID.
+     */
     template<typename FormatConfig>
     void configure_h264_hevc_metadata(
       FormatConfig &format_config,
@@ -352,10 +375,17 @@ namespace NVENC_NAMESPACE {
       std::uint32_t initial_vbv = 0;  ///< VBV buffer size at initialization, in bits.
     } reconfigure_state;  ///< What `set_bitrate()` needs to rebuild the parameters.
 
+    struct ltr_slot_t {
+      uint64_t frame_index = 0;  ///< Frame marked into the slot.
+      bool valid = false;  ///< The client has decoded it: marked before any loss since.
+    };
+
     struct {
       uint64_t last_encoded_frame_index = 0;
       bool rfi_needs_confirmation = false;
       std::pair<uint64_t, uint64_t> last_rfi_range;
+      std::array<ltr_slot_t, 4> ltr {};  ///< Long-term reference slots, the first encoder_params.ltr_frames in use.
+      int ltr_use = -1;  ///< Slot the next frame has to predict from, after a repair too large for the DPB.
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
     } encoder_state;
   };
