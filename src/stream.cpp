@@ -33,6 +33,7 @@ extern "C" {
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
+#include "stream_fec.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -820,60 +821,7 @@ namespace stream {
       return (RS8_DATA_SHARDS_MAX * 100) / (100 + percentage);
     }
 
-    /**
-     * @brief Owning pointer for a Reed-Solomon encoder instance.
-     */
-    using rs_t = util::safe_ptr<reed_solomon, [](reed_solomon *rs) {
-      reed_solomon_release(rs);
-    }>;
-
-    /**
-     * @brief Reed-Solomon FEC encoder state for video packets.
-     */
-    struct fec_t {
-      size_t data_shards;  ///< Number of original packet shards in each FEC block.
-      size_t nr_shards;  ///< Total data and recovery shards generated for each FEC block.
-      size_t percentage;  ///< Recovery-shard percentage requested for the stream.
-
-      size_t blocksize;  ///< Bytes reserved for the payload portion of each shard.
-      size_t prefixsize;  ///< Bytes reserved before each shard payload for protocol headers.
-      util::buffer_t<char> shards;  ///< Contiguous backing storage for all encoded FEC shards.
-      util::buffer_t<char> headers;  ///< Backing storage for the RTP/FEC headers attached to shards.
-      util::buffer_t<uint8_t *> shards_p;  ///< Pointer table passed to the Reed-Solomon encoder.
-
-      std::vector<platf::buffer_descriptor_t> payload_buffers;  ///< Platform send descriptors for FEC payload buffers.
-
-      /**
-       * @brief Return the FEC shard data pointer for a packet-group element.
-       *
-       * @param el Packet-group element index.
-       * @return Pointer to the shard bytes for the requested element.
-       */
-      char *data(size_t el) {
-        return (char *) shards_p[el];
-      }
-
-      /**
-       * @brief Return the FEC prefix bytes for the current packet group.
-       *
-       * @param el Packet-group element index.
-       * @return Pointer to the element's prefix bytes, or nullptr when no prefix is used.
-       */
-      char *prefix(size_t el) {
-        return prefixsize ? &headers[el * prefixsize] : nullptr;
-      }
-
-      /**
-       * @brief Return the serialized size of the current object.
-       *
-       * @return Number of elements currently stored.
-       */
-      size_t size() const {
-        return nr_shards;
-      }
-    };
-
-    static fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize) {
+    fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize) {
       auto payload_size = payload.size();
 
       auto pad = payload_size % blocksize != 0;
@@ -884,7 +832,7 @@ namespace stream {
 
       // increase the FEC percentage for this frame if the parity shard minimum is not met
       if (parity_shards < minparityshards && fecpercentage != 0) {
-        parity_shards = minparityshards;
+        parity_shards = std::min(minparityshards, kMaxShards > data_shards ? kMaxShards - data_shards : 0);
         fecpercentage = (100 * parity_shards) / data_shards;
 
         BOOST_LOG(verbose) << "Increasing FEC percentage to "sv << fecpercentage << " to meet parity shard minimum"sv << std::endl;
@@ -933,9 +881,15 @@ namespace stream {
         }
 
         // packets = parity_shards + data_shards
-        rs_t rs {reed_solomon_new((int) data_shards, (int) parity_shards)};
+        rs_t rs {nr_shards <= kMaxShards && parity_shards > 0 ? reed_solomon_new((int) data_shards, (int) parity_shards) : nullptr};
 
-        reed_solomon_encode(rs.get(), shards_p.begin(), (int) nr_shards, (int) blocksize);
+        if (!rs || reed_solomon_encode(rs.get(), shards_p.begin(), (int) nr_shards, (int) blocksize) < 0) {
+          // The client cannot decode a block whose parity was never computed: it goes out without parity
+          BOOST_LOG(error) << "Reed-Solomon encoding failed for "sv << data_shards << " data and "sv << parity_shards << " parity shards; sending the block without parity"sv;
+          fecpercentage = 0;
+          parity_shards = 0;
+          nr_shards = data_shards;
+        }
       }
 
       return {
