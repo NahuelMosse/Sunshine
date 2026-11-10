@@ -171,6 +171,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/abr/control.h"
         "${CMAKE_SOURCE_DIR}/src/abr/params.cpp"
         "${CMAKE_SOURCE_DIR}/src/abr/params.h"
+        "${CMAKE_SOURCE_DIR}/src/abr/gamestream/signals.cpp"
+        "${CMAKE_SOURCE_DIR}/src/abr/gamestream/signals.h"
         "${CMAKE_SOURCE_DIR}/src/stream.cpp"
         "${CMAKE_SOURCE_DIR}/src/stream.h"
         "${CMAKE_SOURCE_DIR}/src/video.cpp"

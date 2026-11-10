@@ -13,6 +13,7 @@
 #include <vector>
 
 // local includes
+#include <src/abr/gamestream/signals.h>
 #include <src/config.h>
 #include <src/frame_divider.h>
 
