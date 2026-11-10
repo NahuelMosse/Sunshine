@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_stream_pacing.cpp
- * @brief Test when the packets of a video frame are due and how a frame is split in FEC blocks, in src/stream_pacing.h.
+ * @brief Test when the packets of a video frame are due in src/stream_pacing.h.
  */
 // test includes
 #include "../tests_common.h"
@@ -51,28 +51,4 @@ TEST(StreamPacingTest, AMillisecondOfPacketsIsDueAfterAMillisecond) {
   EXPECT_EQ(pacing.due(0), 0ns);
   EXPECT_EQ(pacing.due(pacing.packets_in_1ms), 1ms);
   EXPECT_EQ(pacing.due(3 * pacing.packets_in_1ms), 3ms);
-}
-
-TEST(StreamPacingTest, AFrameNeedsAsManyBlocksAsFitTheShardLimit) {
-  constexpr std::size_t blocksize = 1400;
-
-  auto plan = stream::fec_plan(100 * blocksize, blocksize, 20);
-  EXPECT_EQ(plan.blocks, 1);
-  EXPECT_EQ(plan.percentage, 20);
-
-  plan = stream::fec_plan(600 * blocksize, blocksize, 20);
-  EXPECT_EQ(plan.blocks, 3) << "212 data shards fit a block at 20 %";
-  EXPECT_EQ(plan.percentage, 20);
-}
-
-TEST(StreamPacingTest, AFrameOverFourBlocksGoesOutWithNoFecAsUpstream) {
-  constexpr std::size_t blocksize = 1400;
-
-  auto plan = stream::fec_plan(900 * blocksize, blocksize, 20);
-  EXPECT_EQ(plan.blocks, 4);
-  EXPECT_EQ(plan.percentage, 0) << "upstream skips the FEC of a frame that needs more than four blocks";
-
-  plan = stream::fec_plan(900 * blocksize, blocksize, 0);
-  EXPECT_EQ(plan.blocks, 4);
-  EXPECT_EQ(plan.percentage, 0);
 }

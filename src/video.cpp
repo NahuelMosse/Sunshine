@@ -26,6 +26,7 @@ extern "C" {
 #include <cstdint>
 
 // local includes
+#include "adaptive_bitrate.h"
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
@@ -2463,6 +2464,22 @@ namespace video {
   }
 
   /**
+   * @brief Tell the stream, once per encoder, how far back it can repair a loss.
+   *
+   * @param session Active encode session.
+   * @param events Event the stream reads the reach from.
+   * @param reported Whether it was already said for this encoder.
+   */
+  void report_repair_reach(const encode_session_t &session, safe::mail_raw_t::event_t<int> &events, bool &reported) {
+    if (reported || !events) {
+      return;
+    }
+    reported = true;
+    // Zero too: an encoder without long-term references replaces one that had them
+    events->raise(std::max(0, session.repair_reach_frames()));
+  }
+
+  /**
    * @brief Run one encode loop for a display capture stream.
    *
    * @param frame_nr Frame counter updated as frames are encoded.
@@ -2520,6 +2537,8 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
+    auto repair_reach_events = mail->event<int>(mail::repair_reach);
+    bool repair_reach_reported = false;
     auto frame_divider_events = mail->event<int>(mail::frame_divider);
     divider.reopened();
 
@@ -2558,6 +2577,8 @@ namespace video {
       if (requested_idr_frame) {
         session->request_idr_frame();
       }
+
+      report_repair_reach(*session, repair_reach_events, repair_reach_reported);
 
       if (frame_divider_events->peek()) {
         if (auto per_mille = frame_divider_events->pop(0ms)) {
