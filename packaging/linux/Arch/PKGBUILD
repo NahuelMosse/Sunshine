@@ -180,7 +180,7 @@ build() {
     cmake "${_cmake_options[@]}"
 
     appstreamcli validate "${_appstreamcli_arguments[@]}" "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
-    appstream-util validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
+    appstream-util validate --nonet "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
     desktop-file-validate "build/dev.lizardbyte.app.Sunshine.desktop"
     desktop-file-validate "build/dev.lizardbyte.app.Sunshine.terminal.desktop"
 
