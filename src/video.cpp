@@ -35,6 +35,7 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#include "video_internal.h"
 
 #ifdef _WIN32
 extern "C" {
@@ -528,6 +529,54 @@ namespace video {
       request_idr_frame();
     }
 
+    /**
+     * @brief Change the bitrate by editing the codec context between frames.
+     *
+     * FFmpeg has no general API for this. The libx264 wrapper compares the context with what the
+     * encoder was configured with on every frame and reconfigures it in place when they differ.
+     * The NVENC wrapper does too, but resets the encoder and forces an IDR frame to do it, and the
+     * QuickSync one drains and resets it; AMF, VAAPI, Vulkan, VideoToolbox, MediaFoundation,
+     * libx265 and SVT-AV1 ignore the change. All of those report it as unsupported.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder will pick up the change.
+     */
+    bool set_bitrate(int kbps) override {
+      if (!avcodec_ctx || !avcodec_ctx->codec || kbps <= 0) {
+        return false;
+      }
+      const std::string_view name {avcodec_ctx->codec->name};
+      const bool reconfigurable = name == "libx264"sv;
+      if (!reconfigurable) {
+        return false;
+      }
+
+      auto &ctx = *avcodec_ctx;
+      const int64_t bitrate = int64_t(kbps) * 1000;
+      const int64_t previous = ctx.rc_max_rate > 0 ? ctx.rc_max_rate : ctx.bit_rate;
+      if (previous <= 0 || previous == bitrate) {
+        return previous == bitrate;
+      }
+
+      // Keep every rate-control field in the same proportion it was opened with: the
+      // one-off difference between bit_rate and rc_max_rate that forces VBR, and the VBV
+      // size in frames
+      const int64_t vbr_offset = ctx.rc_max_rate - ctx.bit_rate;
+      ctx.rc_max_rate = bitrate;
+      ctx.bit_rate = bitrate - vbr_offset;
+      if (ctx.rc_min_rate > 0) {
+        ctx.rc_min_rate = bitrate;
+      }
+      if (ctx.rc_buffer_size > 0) {
+        ctx.rc_buffer_size = static_cast<int>(int64_t(ctx.rc_buffer_size) * bitrate / previous);
+      }
+      return true;
+    }
+
+    int opened_bitrate_kbps() const override {
+      return static_cast<int>((avcodec_ctx->rc_max_rate > 0 ? avcodec_ctx->rc_max_rate : avcodec_ctx->bit_rate) / 1000);
+    }
+
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
@@ -595,6 +644,14 @@ namespace video {
       if (!device->nvenc->invalidate_ref_frames(first_frame, last_frame)) {
         force_idr = true;
       }
+    }
+
+    bool set_bitrate(int kbps) override {
+      return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
+    int opened_bitrate_kbps() const override {
+      return device && device->nvenc ? static_cast<int>(device->nvenc->bitrate_kbps()) : 0;
     }
 
     /**
@@ -1469,6 +1526,7 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
