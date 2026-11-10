@@ -72,6 +72,15 @@ namespace nvenc {
     virtual bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) = 0;
 
     /**
+     * @brief Take the client's acknowledgement of a long-term reference frame (0x0350); an
+     * encoder without long-term references ignores it.
+     *
+     * @param frame_index The acknowledged frame's 32-bit index.
+     */
+    virtual void acknowledge_ltr([[maybe_unused]] std::uint32_t frame_index) {
+    }
+
+    /**
      * @brief Change the target bitrate without recreating the encoder.
      *
      * @param kbps New target bitrate in kilobits per second.
@@ -79,6 +88,15 @@ namespace nvenc {
      */
     virtual bool set_bitrate(std::uint32_t kbps) {
       return false;
+    }
+
+    /**
+     * @brief How many frames back a loss can be repaired from a long-term reference.
+     *
+     * @return Frames, or 0 without long-term references.
+     */
+    virtual std::uint32_t repair_reach_frames() const {
+      return 0;
     }
 
     /**

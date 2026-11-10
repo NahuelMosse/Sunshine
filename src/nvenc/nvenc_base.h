@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <array>
 #include <variant>
 
 // local includes
@@ -12,6 +13,7 @@
 #include "nvenc_config.h"
 #include "nvenc_encoded_frame.h"
 #include "nvenc_encoder.h"
+#include "nvenc_ltr.h"
 #include "nvenc_sdk.h"
 #include "src/logging.h"
 #include "src/video.h"
@@ -93,12 +95,26 @@ namespace NVENC_NAMESPACE {
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) override;
 
     /**
+     * @brief Keep the client's acknowledgement of a long-term reference frame when a slot still
+     *        holds it and it is newer than the one kept.
+     * @param frame_index The acknowledged frame's 32-bit index.
+     */
+    void acknowledge_ltr(std::uint32_t frame_index) override;
+
+    /**
      * @brief Change the target bitrate with `nvEncReconfigureEncoder()`, keeping the encoder,
      *        its reference frames and the VBV size in frames.
      * @param kbps New target bitrate in kilobits per second.
      * @return `true` on success, `false` if the GPU does not support dynamic bitrate or the call failed.
      */
     bool set_bitrate(std::uint32_t kbps) override;
+
+    /**
+     * @brief How many frames back a loss can be repaired from a long-term reference.
+     *
+     * @return Frames covered by every slot but the newest mark, or 0 without long-term references.
+     */
+    std::uint32_t repair_reach_frames() const override;
 
     /**
      * @brief The target bitrate the encoder runs at.
@@ -150,6 +166,12 @@ namespace NVENC_NAMESPACE {
      */
     bool nvenc_failed(NVENCSTATUS status);
 
+    /**
+     * @brief The slot holding the long-term reference the client acknowledged last.
+     * @return The slot, or -1 when no valid slot holds it.
+     */
+    int acked_slot() const;
+
     const NV_ENC_DEVICE_TYPE device_type;  ///< NVENC device backend used by this encoder instance.
 
     encoder_session_t *encoder = nullptr;  ///< Opaque NVENC encoder session handle returned by the driver.
@@ -160,6 +182,9 @@ namespace NVENC_NAMESPACE {
       NV_ENC_BUFFER_FORMAT buffer_format = NV_ENC_BUFFER_FORMAT_UNDEFINED;
       uint32_t ref_frames_in_dpb = 0;
       bool rfi = false;
+      int video_format = 0;  ///< 0 H.264, 1 HEVC, 2 AV1.
+      uint32_t ltr_frames = 0;  ///< Long-term reference slots kept for repairs, 0 without them.
+      bool repairs = false;  ///< The client acknowledges long-term references: keep them and the DPB they need.
     } encoder_params;  ///< Current encoder dimensions, pixel format, and reference-frame settings.
 
     std::string last_nvenc_error_string;  ///< Last NVENC error string.
@@ -227,6 +252,7 @@ namespace NVENC_NAMESPACE {
      * @param list0_option Codec-specific list-zero option.
      * @param default_count Default reference-frame count.
      * @param requested_count Client-requested reference-frame count.
+     * @param client_config The session's resolution and frame rate, for the level's DPB.
      * @param encode_guid Selected codec GUID.
      */
     void configure_reference_frames(
@@ -234,8 +260,19 @@ namespace NVENC_NAMESPACE {
       NV_ENC_NUM_REF_FRAMES &list0_option,
       std::uint32_t default_count,
       int requested_count,
+      const video::config_t &client_config,
       const GUID &encode_guid
     );
+
+    /**
+     * @brief Keep long-term reference slots that a repair predicts from.
+     *
+     * @tparam FormatConfig Codec-specific NVENC configuration type.
+     * @param format_config Codec-specific encoder configuration to update.
+     * @param encode_guid Selected codec GUID.
+     */
+    template<typename FormatConfig>
+    void configure_long_term_references(FormatConfig &format_config, const GUID &encode_guid);
 
     /**
      * @brief Configure VUI metadata and intra-refresh options shared by H.264 and HEVC.
@@ -375,6 +412,9 @@ namespace NVENC_NAMESPACE {
       uint64_t last_encoded_frame_index = 0;
       bool rfi_needs_confirmation = false;
       std::pair<uint64_t, uint64_t> last_rfi_range;
+      std::array<::nvenc::ltr_slot_t, ::nvenc::ltr_slots_kept> ltr {};  ///< Long-term reference slots, the first encoder_params.ltr_frames in use.
+      int ltr_use = -1;  ///< Slot the next frame has to predict from, after a repair.
+      int64_t ltr_acked = -1;  ///< The most recent long-term reference frame the client acknowledged, -1 for none.
       logging::min_max_avg_periodic_logger<double> frame_size_logger = {debug, "NvEnc: encoded frame sizes in kB", ""};
     } encoder_state;
   };

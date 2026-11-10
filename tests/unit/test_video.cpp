@@ -683,6 +683,12 @@ TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
   }
 }
 
+// @ABR-01-S2 @ABR-01-S9 @ABR-18-S9
+TEST_F(Libx264SessionTest, ReportsNoRepairReachWithoutLongTermReferences) {
+  open(0);
+  EXPECT_EQ(session->repair_reach_frames(), 0);
+}
+
 namespace {
   /**
    * @brief An NVENC encoder that takes a new bitrate and says which one it runs at.
