@@ -129,7 +129,7 @@ build() {
 		-DSUNSHINE_PUBLISHER_ISSUE_URL=https://app.lizardbyte.dev/support
 
 	appstreamcli validate --no-net "$_build_dir/dev.lizardbyte.app.Sunshine.metainfo.xml"
-	appstream-util validate "$_build_dir/dev.lizardbyte.app.Sunshine.metainfo.xml"
+	appstream-util validate --nonet "$_build_dir/dev.lizardbyte.app.Sunshine.metainfo.xml"
 	desktop-file-validate "$_build_dir/dev.lizardbyte.app.Sunshine.desktop"
 	desktop-file-validate "$_build_dir/dev.lizardbyte.app.Sunshine.terminal.desktop"
 

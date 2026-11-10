@@ -791,9 +791,9 @@ function run_step_validation() {
   echo "Running step: Validation"
 
   # Run appstream validation, etc.
-  appstreamcli validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
+  appstreamcli validate --no-net "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
   if [[ "$distro" != "$DISTRO_UBUNTU" ]] || [[ "$version" < "$UBUNTU_APPSTREAM_GLIB_REMOVAL_VERSION" ]]; then
-    appstream-util validate "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
+    appstream-util validate --nonet "build/dev.lizardbyte.app.Sunshine.metainfo.xml"
   fi
   desktop-file-validate "build/dev.lizardbyte.app.Sunshine.desktop"
   if [[ "$appimage_build" == 0 ]]; then
