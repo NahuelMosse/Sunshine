@@ -17,12 +17,16 @@
 
 // ffmpeg includes
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 }
 
 // local includes
 #include <src/config.h>
+#include <src/display_device.h>
+#include <src/nvenc/nvenc_encoder.h>
+#include <src/platform/common.h>
 #include <src/video.h>
 
 using namespace std::literals;
@@ -539,4 +543,206 @@ TEST(SoftwareEncoderConversion, Bgr0AndNv12) {
   fallback_nv12_img.height = h;
   fallback_nv12_img.row_pitch = w;
   EXPECT_EQ(device.convert(fallback_nv12_img), 0);
+}
+
+// Defined in src/video.cpp and not part of its header: the encoder session is driven here the way the
+// capture loop does, without a stream around it.
+namespace video {
+  std::unique_ptr<platf::encode_device_t> make_encode_device(platf::display_t &disp, const encoder_t &encoder, const config_t &config);
+  std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device);
+  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, stream::session_t *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp);
+}  // namespace video
+
+/**
+ * @brief libx264 sessions, encoded frame by frame and decoded again.
+ */
+struct Libx264SessionTest: PlatformTestSuite {
+  void SetUp() override {
+    BaseTest::SetUp();
+    if (!avcodec_find_encoder_by_name("libx264")) {
+      GTEST_SKIP() << "this FFmpeg build has no libx264";
+    }
+    if (!video::validate_encoder(video::software, false)) {
+      FAIL() << "Software encoder not available";
+    }
+  }
+
+  /**
+   * @brief Open a libx264 session with `refs` reference frames.
+   */
+  void open(int refs) {
+    const video::config_t config {1280, 720, 60, 6000, 6000, 1, refs, 1, 0, 0, 0, 0};
+    display = platf::display(video::software.platform_formats->dev_type, display_device::map_output_name(config::video.output_name), config);
+    ASSERT_TRUE(display) << "no display to capture from";
+    auto device = video::make_encode_device(*display, video::software, config);
+    ASSERT_TRUE(device);
+    session = video::make_encode_session(display.get(), video::software, config, display->width, display->height, std::move(device));
+    ASSERT_TRUE(session);
+    image = display->alloc_img();
+    ASSERT_TRUE(image);
+    ASSERT_EQ(display->dummy_img(image.get()), 0);
+    packets = mail::man->queue<video::packet_t>(mail::video_packets);
+
+    // An FFmpeg built without decoders still gets every frame type check
+    if (const auto *h264 = avcodec_find_decoder(AV_CODEC_ID_H264)) {
+      decoder.reset(avcodec_alloc_context3(h264));
+      ASSERT_TRUE(decoder);
+      decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
+      decoder->thread_count = 1;
+      ASSERT_EQ(avcodec_open2(decoder.get(), nullptr, nullptr), 0);
+    }
+  }
+
+  /**
+   * @brief Count the frames the decoder has ready.
+   */
+  void drain_decoder() {
+    std::unique_ptr<AVFrame, void (*)(AVFrame *)> out {av_frame_alloc(), [](AVFrame *f) {
+                                                         av_frame_free(&f);
+                                                       }};
+    while (avcodec_receive_frame(decoder.get(), out.get()) == 0) {
+      ++decoded;
+    }
+  }
+
+  /**
+   * @brief Encode one frame and decode what comes out.
+   *
+   * @return The packet, which is the encoder's answer for that frame.
+   */
+  video::packet_t encode_next(bool idr = false) {
+    ++frame;
+    if (idr) {
+      session->request_idr_frame();
+    }
+    if (session->convert(*image) || video::encode(frame, *session, packets, nullptr, {})) {
+      ADD_FAILURE() << "frame " << frame << " was not encoded";
+      return nullptr;
+    }
+    // The capture loop goes back to plain frames after each one; requests come in between
+    session->request_normal_frame();
+    auto packet = packets->pop(2s);
+    if (!packet) {
+      ADD_FAILURE() << "frame " << frame << " produced no packet";
+      return nullptr;
+    }
+    auto *raw = dynamic_cast<video::packet_raw_avcodec *>(packet.get());
+    if (!raw) {
+      ADD_FAILURE() << "libx264 packets are avcodec packets";
+      return nullptr;
+    }
+    EXPECT_EQ(packet->frame_index(), frame);
+    if (decoder) {
+      if (avcodec_send_packet(decoder.get(), raw->av_packet) < 0) {
+        ADD_FAILURE() << "frame " << frame << " does not decode";
+      }
+      drain_decoder();
+    }
+    return packet;
+  }
+
+  std::shared_ptr<platf::display_t> display;
+  std::unique_ptr<video::encode_session_t> session;
+  std::shared_ptr<platf::img_t> image;
+  safe::mail_raw_t::queue_t<video::packet_t> packets;
+  std::unique_ptr<AVCodecContext, void (*)(AVCodecContext *)> decoder {nullptr, [](AVCodecContext *c) {
+                                                                         avcodec_free_context(&c);
+                                                                       }};
+  int64_t frame = 0;
+  int decoded = 0;
+};
+
+TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
+  open(0);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 6000);
+  EXPECT_FALSE(session->set_bitrate(0));
+  EXPECT_FALSE(session->set_bitrate(-10));
+  EXPECT_TRUE(session->set_bitrate(6000)) << "already what it has";
+  EXPECT_TRUE(session->set_bitrate(3000));
+  EXPECT_EQ(session->opened_bitrate_kbps(), 3000);
+  EXPECT_TRUE(session->set_bitrate(3000));
+
+  // The stream goes on decoding across the change, in both directions
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+  EXPECT_TRUE(session->set_bitrate(9000));
+  for (int i = 0; i < 3; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr()) << "changing the bitrate must not cost a keyframe";
+  }
+  // The client decoded every frame it was sent
+  if (decoder) {
+    avcodec_send_packet(decoder.get(), nullptr);
+    drain_decoder();
+    EXPECT_EQ(decoded, frame);
+  }
+}
+
+namespace {
+  /**
+   * @brief An NVENC encoder that takes a new bitrate and says which one it runs at.
+   */
+  struct adjustable_nvenc_t: nvenc::nvenc_encoder {
+    bool create_encoder(const nvenc::nvenc_config &, const video::config_t &, const video::sunshine_colorspace_t &, platf::pix_fmt_e) override {
+      return true;
+    }
+
+    void destroy_encoder() override {
+    }
+
+    nvenc::nvenc_encoded_frame encode_frame(std::uint64_t, bool) override {
+      return {};
+    }
+
+    bool invalidate_ref_frames(std::uint64_t, std::uint64_t) override {
+      return false;
+    }
+
+    bool set_bitrate(std::uint32_t kbps) override {
+      current = kbps;
+      return true;
+    }
+
+    std::uint32_t bitrate_kbps() const override {
+      return current;
+    }
+
+    std::uint32_t current = 8000;
+  };
+
+  /**
+   * @brief The platform side of an NVENC session, around a given encoder.
+   */
+  struct adjustable_nvenc_device_t: platf::nvenc_encode_device_t {
+    explicit adjustable_nvenc_device_t(nvenc::nvenc_encoder *encoder) {
+      nvenc = encoder;
+    }
+
+    bool init_encoder(const video::config_t &, const video::sunshine_colorspace_t &) override {
+      return true;
+    }
+
+    int convert(platf::img_t &) override {
+      return 0;
+    }
+  };
+}  // namespace
+
+TEST(NvencSessionBitrateTest, ForwardsTheBitrateToTheEncoder) {
+  adjustable_nvenc_t encoder;
+  const video::config_t config {1280, 720, 60, 8000, 8000, 1, 0, 1, 0, 0, 0, 0};
+  auto session = video::make_encode_session(nullptr, video::software, config, 1280, 720, std::make_unique<adjustable_nvenc_device_t>(&encoder));
+  ASSERT_TRUE(session);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 8000);
+  EXPECT_FALSE(session->set_bitrate(0));
+  EXPECT_FALSE(session->set_bitrate(-10));
+  EXPECT_EQ(encoder.current, 8000U) << "a bitrate that is not positive never reaches the encoder";
+  EXPECT_TRUE(session->set_bitrate(5000));
+  EXPECT_EQ(encoder.current, 5000U);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 5000);
 }
