@@ -34,6 +34,7 @@ extern "C" {
 #include "process.h"
 #include "stream.h"
 #include "stream_fec.h"
+#include "stream_pacing.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -1651,19 +1652,14 @@ namespace stream {
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = 4;
 
-      auto max_data_shards_per_fec_block = fec::max_data_shards(fecPercentage);
-
-      // Compute the number of FEC blocks needed for this frame using the block size and max shards
-      auto max_data_per_fec_block = max_data_shards_per_fec_block * blocksize;
-      auto fec_blocks_needed = (payload.size() + (max_data_per_fec_block - 1)) / max_data_per_fec_block;
-
-      // If the number of FEC blocks needed exceeds the protocol limit, turn off FEC for this frame.
-      // For normal FEC percentages, this should only happen for enormous frames (over 800 packets at 20%).
-      if (fec_blocks_needed > MAX_FEC_BLOCKS) {
-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
-        fecPercentage = 0;
-        fec_blocks_needed = MAX_FEC_BLOCKS;
+      // The blocks the frame needs at the wanted percentage, at most the protocol's four. An
+      // abnormally large frame (over 800 packets at 20%) goes in four with no FEC.
+      const auto plan = fec_plan(payload.size(), blocksize, fecPercentage);
+      if (plan.percentage != fecPercentage) {
+        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame"sv;
+        fecPercentage = plan.percentage;
       }
+      const std::size_t fec_blocks_needed = plan.blocks;
 
       std::array<std::string_view, MAX_FEC_BLOCKS> fec_blocks;
       auto fec_blocks_begin = std::begin(fec_blocks);
@@ -1693,8 +1689,9 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        // Use around 80% of 1Gbps
+        const auto ratecontrol = pacing(blocksize);
+        const size_t ratecontrol_packets_in_1ms = ratecontrol.packets_in_1ms;
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -1808,9 +1805,7 @@ namespace stream {
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
               if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms || ratecontrol_frame_packets_sent == 0) {
-                auto due = ratecontrol_frame_start +
-                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                auto due = ratecontrol_frame_start + ratecontrol.due(ratecontrol_frame_packets_sent);
 
                 auto now = std::chrono::steady_clock::now();
                 if (now < due) {
@@ -1853,9 +1848,7 @@ namespace stream {
           }
 
           // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          ratecontrol_next_frame_start = ratecontrol_frame_start + ratecontrol.due(ratecontrol_frame_packets_sent);
 
           frame_network_latency_logger.second_point_now_and_log();
 
