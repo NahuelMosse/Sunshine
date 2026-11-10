@@ -250,4 +250,60 @@ TEST(NvencFormatMappingTest, MapsSupportedFormatsAndRejectsUnsupportedOnes) {
     EXPECT_EQ(nvenc_1301::nvenc_format_from_sunshine_format(format), expected) << std::to_underlying(format);
   }
 }
+
+namespace {
+  /**
+   * @brief Base encoder with an open session whose driver rejects every reconfiguration.
+   */
+  class failing_reconfigure_encoder_t: public nvenc_base {
+  public:
+    failing_reconfigure_encoder_t():
+        nvenc_base(NV_ENC_DEVICE_TYPE_DIRECTX) {
+      nvenc = std::make_shared<NV_ENCODE_API_FUNCTION_LIST>();
+      nvenc->nvEncReconfigureEncoder = [](auto *, NV_ENC_RECONFIGURE_PARAMS *) {
+        return NV_ENC_ERR_GENERIC;
+      };
+      encoder = std::bit_cast<decltype(encoder)>(&driver);
+      reconfigure_state.supported = true;
+      auto &rc = reconfigure_state.enc_config.rcParams;
+      rc.averageBitRate = 10'000'000;
+      rc.maxBitRate = 10'000'000;
+      rc.vbvBufferSize = 166'666;
+      reconfigure_state.initial_bitrate = rc.averageBitRate;
+      reconfigure_state.initial_vbv = rc.vbvBufferSize;
+    }
+
+    failing_reconfigure_encoder_t(const failing_reconfigure_encoder_t &) = delete;
+    failing_reconfigure_encoder_t &operator=(const failing_reconfigure_encoder_t &) = delete;
+
+    ~failing_reconfigure_encoder_t() override {
+      encoder = nullptr;
+    }
+
+    /**
+     * @brief The VBV buffer the next reconfiguration would start from.
+     * @return Its size, in bits.
+     */
+    std::uint32_t vbv_bits() const {
+      return reconfigure_state.enc_config.rcParams.vbvBufferSize;
+    }
+
+  protected:
+    bool init_library() override {
+      return false;
+    }
+
+    bool create_and_register_input_buffer() override {
+      return false;
+    }
+  };
+}  // namespace
+
+// @ABR-08-S18 @ABR-08-S19
+TEST(NvencBitrateTest, AFailedReconfigureKeepsTheBitrateInUse) {
+  failing_reconfigure_encoder_t encoder;
+  EXPECT_FALSE(encoder.set_bitrate(5000));
+  EXPECT_EQ(encoder.bitrate_kbps(), 10000U) << "the encoder still runs at what it was opened with";
+  EXPECT_EQ(encoder.vbv_bits(), 166'666U);
+}
 #endif

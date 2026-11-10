@@ -70,6 +70,25 @@ namespace nvenc {
      * @return `true` on success, `false` on error.
      */
     virtual bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) = 0;
+
+    /**
+     * @brief Change the target bitrate without recreating the encoder.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return `true` if the encoder accepted it, `false` if it cannot change bitrate on the fly.
+     */
+    virtual bool set_bitrate(std::uint32_t kbps) {
+      return false;
+    }
+
+    /**
+     * @brief The target bitrate the encoder runs at.
+     *
+     * @return Kilobits per second: the one it was opened with until a change succeeds, or 0 without an encoder.
+     */
+    virtual std::uint32_t bitrate_kbps() const {
+      return 0;
+    }
   };
 
 }  // namespace nvenc
