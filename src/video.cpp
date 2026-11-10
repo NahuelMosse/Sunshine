@@ -23,6 +23,7 @@ extern "C" {
   #include <ffnvcodec/nvEncodeAPI.h>
 #endif
 }
+#include <cstdint>
 
 // local includes
 #include "cbs.h"
@@ -646,8 +647,18 @@ namespace video {
       }
     }
 
+    void acknowledge_ltr(std::uint32_t frame_index) override {
+      if (device && device->nvenc) {
+        device->nvenc->acknowledge_ltr(frame_index);
+      }
+    }
+
     bool set_bitrate(int kbps) override {
       return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
+    int repair_reach_frames() const override {
+      return device && device->nvenc ? static_cast<int>(device->nvenc->repair_reach_frames()) : 0;
     }
 
     int opened_bitrate_kbps() const override {
@@ -1983,6 +1994,7 @@ namespace video {
     auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
     packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+    packet->ltr_frame = encoded_frame.ltr_frame;
     packet->frame_timestamp = frame_timestamp;
     packets->raise(std::move(packet));
 
@@ -2501,6 +2513,7 @@ namespace video {
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+    auto ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2515,6 +2528,13 @@ namespace video {
 
     while (true) {
       bool requested_idr_frame = false;
+
+      // An acknowledgement that arrived with a repair request may be the frame it predicts from
+      while (ltr_ack_events->peek()) {
+        if (auto frame = ltr_ack_events->pop(0ms)) {
+          session->acknowledge_ltr(*frame);
+        }
+      }
 
       while (invalidate_ref_frames_events->peek()) {
         if (auto frames = invalidate_ref_frames_events->pop(0ms)) {

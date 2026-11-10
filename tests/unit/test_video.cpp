@@ -8,11 +8,13 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -685,6 +687,12 @@ TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
   }
 }
 
+// @ABR-01-S2 @ABR-01-S9 @ABR-18-S9
+TEST_F(Libx264SessionTest, ReportsNoRepairReachWithoutLongTermReferences) {
+  open(0);
+  EXPECT_EQ(session->repair_reach_frames(), 0);
+}
+
 namespace {
   /**
    * @brief An NVENC encoder that takes a new bitrate and says which one it runs at.
@@ -819,4 +827,195 @@ TEST_F(Libx264SessionTest, AnotherSoftwareEncoderKeepsTheBitrateItWasOpenedWith)
 
   EXPECT_FALSE(session->set_bitrate(3000)) << "only libx264 picks up a new bitrate between frames";
   EXPECT_EQ(session->opened_bitrate_kbps(), 6000);
+}
+
+TEST_F(Libx264SessionTest, AnAcknowledgementChangesNothingWithoutLongTermReferences) {
+  open(0);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+
+  // The client acknowledges a frame as if it carried a long-term reference: libx264 marks none
+  session->acknowledge_ltr(2);
+  auto next = encode_next();
+  ASSERT_TRUE(next);
+  EXPECT_FALSE(next->is_idr());
+  EXPECT_FALSE(next->after_ref_frame_invalidation);
+  if (decoder) {
+    avcodec_send_packet(decoder.get(), nullptr);
+    drain_decoder();
+    EXPECT_EQ(decoded, frame);
+  }
+}
+
+namespace {
+  /**
+   * @brief An NVENC encoder with long-term references: it marks every 30th frame, takes the
+   * client's acknowledgements, repairs a loss without an IDR frame and says what it was asked, in order.
+   */
+  struct repairing_nvenc_t: adjustable_nvenc_t {
+    nvenc::nvenc_encoded_frame encode_frame(std::uint64_t frame_index, bool force_idr) override {
+      calls.push_back("encode " + std::to_string(frame_index));
+      nvenc::nvenc_encoded_frame frame;
+      frame.data = {0, 0, 0, 1, 0x65};
+      frame.frame_index = frame_index;
+      frame.idr = force_idr;
+      frame.ltr_frame = frame_index % 30 == 0;
+      return frame;
+    }
+
+    bool invalidate_ref_frames(std::uint64_t first_frame, std::uint64_t last_frame) override {
+      calls.push_back("invalidate " + std::to_string(first_frame) + "-" + std::to_string(last_frame));
+      return true;
+    }
+
+    void acknowledge_ltr(std::uint32_t frame_index) override {
+      calls.push_back("acknowledge " + std::to_string(frame_index));
+    }
+
+    std::uint32_t repair_reach_frames() const override {
+      return 30;
+    }
+
+    std::vector<std::string> calls;
+  };
+}  // namespace
+
+TEST(NvencSessionLtrTest, AnEncoderWithoutLongTermReferencesRepairsNothingFromThem) {
+  plain_nvenc_t encoder;
+  const video::config_t config {1280, 720, 60, 8000, 8000, 1, 0, 1, 0, 0, 0, 0};
+  auto session = video::make_encode_session(nullptr, video::software, config, 1280, 720, std::make_unique<adjustable_nvenc_device_t>(&encoder));
+  ASSERT_TRUE(session);
+  session->acknowledge_ltr(30);
+  EXPECT_EQ(session->repair_reach_frames(), 0);
+}
+
+TEST(NvencSessionLtrTest, TheSessionCarriesTheMarkAndTheAcknowledgementsOfTheEncoder) {
+  repairing_nvenc_t encoder;
+  const video::config_t config {1280, 720, 60, 8000, 8000, 1, 0, 1, 0, 0, 0, 0};
+  auto session = video::make_encode_session(nullptr, video::software, config, 1280, 720, std::make_unique<adjustable_nvenc_device_t>(&encoder));
+  ASSERT_TRUE(session);
+  EXPECT_EQ(session->repair_reach_frames(), 30);
+
+  auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+  while (packets->peek()) {
+    packets->pop();
+  }
+  ASSERT_EQ(video::encode(30, *session, packets, nullptr, {}), 0);
+  ASSERT_EQ(video::encode(31, *session, packets, nullptr, {}), 0);
+  auto marked = packets->pop(2s);
+  ASSERT_TRUE(marked);
+  EXPECT_EQ(marked->frame_index(), 30);
+  EXPECT_TRUE(marked->ltr_frame) << "the packet tells the stream which frames the client acknowledges";
+  auto plain = packets->pop(2s);
+  ASSERT_TRUE(plain);
+  EXPECT_FALSE(plain->ltr_frame);
+
+  session->acknowledge_ltr(30);
+  EXPECT_EQ(encoder.calls, (std::vector<std::string> {"encode 30", "encode 31", "acknowledge 30"}));
+}
+
+namespace video {
+  void encode_run(int &frame_nr, safe::mail_t mail, img_event_t images, config_t config, std::shared_ptr<platf::display_t> disp, std::unique_ptr<platf::encode_device_t> encode_device, safe::signal_t &reinit_event, const encoder_t &encoder, stream::session_t *channel_data);
+}  // namespace video
+
+namespace {
+  /**
+   * @brief A display the encode loop takes blank images from; the images it encodes come from the test.
+   */
+  struct blank_display_t: platf::display_t {
+    blank_display_t() {
+      width = 1280;
+      height = 720;
+    }
+
+    platf::capture_e capture(const push_captured_image_cb_t &, const pull_free_image_cb_t &, bool *) override {
+      return platf::capture_e::ok;
+    }
+
+    std::shared_ptr<platf::img_t> alloc_img() override {
+      return std::make_shared<platf::img_t>();
+    }
+
+    int dummy_img(platf::img_t *) override {
+      return 0;
+    }
+  };
+}  // namespace
+
+/**
+ * @brief The encode loop of a stream, on its own thread, around an NVENC encoder that needs no GPU.
+ */
+struct EncodeLoopTest: testing::Test {
+  void SetUp() override {
+    saved_fps_target = config::video.minimum_fps_target;
+    // No frame goes out again for lack of a newer image unless a test asks for it
+    config::video.minimum_fps_target = 0.1;
+    packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    while (packets->peek()) {
+      packets->pop();
+    }
+  }
+
+  void TearDown() override {
+    stop();
+    config::video.minimum_fps_target = saved_fps_target;
+  }
+
+  void start() {
+    loop = std::thread {[this] {
+      video::encode_run(frame_nr, mail, images, config, display, std::make_unique<adjustable_nvenc_device_t>(&encoder), reinit, video::software, nullptr);
+    }};
+  }
+
+  void stop() {
+    images->stop();
+    if (loop.joinable()) {
+      loop.join();
+    }
+  }
+
+  /**
+   * @brief Hand the loop a captured image and wait until it takes it.
+   */
+  void capture(std::chrono::steady_clock::time_point at) {
+    auto img = std::make_shared<platf::img_t>();
+    img->frame_timestamp = at;
+    images->raise(std::move(img));
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (images->peek()) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        ADD_FAILURE() << "the encode loop did not take the image";
+        return;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+  }
+
+  repairing_nvenc_t encoder;
+  safe::mail_t mail = std::make_shared<safe::mail_raw_t>();
+  video::img_event_t images = std::make_shared<video::img_event_t::element_type>();
+  video::config_t config {1280, 720, 60, 6000, 8000, 1, 0, 1, 0, 0, 0, 0};
+  std::shared_ptr<platf::display_t> display = std::make_shared<blank_display_t>();
+  safe::signal_t reinit;
+  safe::mail_raw_t::queue_t<video::packet_t> packets;
+  int frame_nr = 1;
+  std::thread loop;
+  double saved_fps_target = 0;
+};
+
+TEST_F(EncodeLoopTest, AnAcknowledgementReachesTheEncoderBeforeTheRepairItCameWith) {
+  auto acks = mail->event<std::uint32_t>(mail::ltr_ack);
+  auto invalidations = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+  acks->raise(30u);
+  invalidations->raise(std::make_pair(int64_t {31}, int64_t {32}));
+  start();
+  capture(std::chrono::steady_clock::now());
+  auto packet = packets->pop(5s);
+  stop();
+  ASSERT_TRUE(packet);
+  EXPECT_EQ(packet->frame_index(), 1);
+  EXPECT_EQ(encoder.calls, (std::vector<std::string> {"acknowledge 30", "invalidate 31-32", "encode 1"})) << "the frame the repair predicts from may be the one just acknowledged";
 }
