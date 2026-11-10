@@ -29,6 +29,7 @@ extern "C" {
 #include "cbs.h"
 #include "config.h"
 #include "display_device.h"
+#include "frame_divider.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -2470,6 +2471,7 @@ namespace video {
    * @param reinit_event Signal raised while the encoder/display is reinitializing.
    * @param encoder Selected encoder.
    * @param channel_data Stream session carried with each encoded packet.
+   * @param divider The share of captured images to encode; it outlives each encoder of the session.
    */
   void encode_run(
     int &frame_nr,  // Store progress of the frame number
@@ -2480,7 +2482,8 @@ namespace video {
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
     const encoder_t &encoder,
-    stream::session_t *channel_data
+    stream::session_t *channel_data,
+    frame_divider_t &divider
   ) {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
@@ -2514,6 +2517,8 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
+    auto frame_divider_events = mail->event<int>(mail::frame_divider);
+    divider.reopened();
 
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
@@ -2551,18 +2556,33 @@ namespace video {
         session->request_idr_frame();
       }
 
+      if (frame_divider_events->peek()) {
+        if (auto per_mille = frame_divider_events->pop(0ms)) {
+          divider.set_frames_kept(*per_mille / 1000.0);
+        }
+      }
+
       std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
-        if (auto img = images->pop(max_frametime)) {
+        std::shared_ptr<platf::img_t> img;
+        if (auto captured = images->pop(max_frametime)) {
+          img = divider.captured(std::move(captured), requested_idr_frame);
+          if (!img) {
+            continue;
+          }
+        } else if (!images->running()) {
+          break;
+        } else {
+          img = divider.timed_out();
+        }
+        if (img) {
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
             return;
           }
-        } else if (!images->running()) {
-          break;
         }
       }
 
@@ -2975,6 +2995,9 @@ namespace video {
     }
 
     int frame_nr = 1;
+    // The share of captured frames to encode, set through mail::frame_divider. It is set once,
+    // so it outlives an encoder restart.
+    frame_divider_t divider;
 
     auto touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
     auto hdr_event = mail->event<hdr_info_t>(mail::hdr);
@@ -3029,7 +3052,8 @@ namespace video {
         std::move(encode_device),
         ref->reinit_event,
         *ref->encoder_p,
-        channel_data
+        channel_data,
+        divider
       );
     }
   }

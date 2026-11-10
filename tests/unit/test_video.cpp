@@ -29,6 +29,7 @@ extern "C" {
 // local includes
 #include <src/config.h>
 #include <src/display_device.h>
+#include <src/frame_divider.h>
 #include <src/nvenc/nvenc_encoder.h>
 #include <src/platform/common.h>
 #include <src/video.h>
@@ -918,7 +919,7 @@ TEST(NvencSessionLtrTest, TheSessionCarriesTheMarkAndTheAcknowledgementsOfTheEnc
 }
 
 namespace video {
-  void encode_run(int &frame_nr, safe::mail_t mail, img_event_t images, config_t config, std::shared_ptr<platf::display_t> disp, std::unique_ptr<platf::encode_device_t> encode_device, safe::signal_t &reinit_event, const encoder_t &encoder, stream::session_t *channel_data);
+  void encode_run(int &frame_nr, safe::mail_t mail, img_event_t images, config_t config, std::shared_ptr<platf::display_t> disp, std::unique_ptr<platf::encode_device_t> encode_device, safe::signal_t &reinit_event, const encoder_t &encoder, stream::session_t *channel_data, frame_divider_t &divider);
 }  // namespace video
 
 namespace {
@@ -966,7 +967,7 @@ struct EncodeLoopTest: testing::Test {
 
   void start() {
     loop = std::thread {[this] {
-      video::encode_run(frame_nr, mail, images, config, display, std::make_unique<adjustable_nvenc_device_t>(&encoder), reinit, video::software, nullptr);
+      video::encode_run(frame_nr, mail, images, config, display, std::make_unique<adjustable_nvenc_device_t>(&encoder), reinit, video::software, nullptr, divider);
     }};
   }
 
@@ -1000,6 +1001,7 @@ struct EncodeLoopTest: testing::Test {
   video::config_t config {1280, 720, 60, 6000, 8000, 1, 0, 1, 0, 0, 0, 0};
   std::shared_ptr<platf::display_t> display = std::make_shared<blank_display_t>();
   safe::signal_t reinit;
+  video::frame_divider_t divider;
   safe::mail_raw_t::queue_t<video::packet_t> packets;
   int frame_nr = 1;
   std::thread loop;
@@ -1018,4 +1020,45 @@ TEST_F(EncodeLoopTest, AnAcknowledgementReachesTheEncoderBeforeTheRepairItCameWi
   ASSERT_TRUE(packet);
   EXPECT_EQ(packet->frame_index(), 1);
   EXPECT_EQ(encoder.calls, (std::vector<std::string> {"acknowledge 30", "invalidate 31-32", "encode 1"})) << "the frame the repair predicts from may be the one just acknowledged";
+}
+
+TEST_F(EncodeLoopTest, AskedForHalfTheFramesItEncodesEveryOtherCapturedImage) {
+  auto shares = mail->event<int>(mail::frame_divider);
+  shares->raise(500);
+  start();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 1; i <= 8; ++i) {
+    capture(t0 + i * 16ms);
+  }
+  std::vector<std::chrono::steady_clock::time_point> encoded;
+  for (int i = 0; i < 4; ++i) {
+    auto packet = packets->pop(5s);
+    ASSERT_TRUE(packet) << "packet " << i;
+    ASSERT_TRUE(packet->frame_timestamp);
+    encoded.push_back(*packet->frame_timestamp);
+  }
+  stop();
+  EXPECT_FALSE(packets->peek()) << "four of eight images";
+  EXPECT_EQ(encoded, (std::vector<std::chrono::steady_clock::time_point> {t0 + 32ms, t0 + 64ms, t0 + 96ms, t0 + 128ms}));
+}
+
+TEST_F(EncodeLoopTest, ASkippedImageGoesOutWhenNoNewerOneArrivesInTime) {
+  config::video.minimum_fps_target = 20;
+  auto shares = mail->event<int>(mail::frame_divider);
+  shares->raise(500);
+  start();
+  const auto captured = std::chrono::steady_clock::now();
+  capture(captured);
+
+  // The divider keeps the image back; within 50 ms the loop encodes it rather than the one before
+  std::optional<std::chrono::steady_clock::time_point> encoded;
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (!encoded && std::chrono::steady_clock::now() < deadline) {
+    if (auto packet = packets->pop(100ms); packet) {
+      encoded = packet->frame_timestamp;
+    }
+  }
+  stop();
+  ASSERT_TRUE(encoded) << "the skipped image never went out";
+  EXPECT_EQ(*encoded, captured);
 }
