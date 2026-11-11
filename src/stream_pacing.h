@@ -31,6 +31,8 @@ namespace stream {
    * @brief How the video sender spreads a frame's packets over time.
    */
   struct pacing_t {
+    bool adaptive = false;  ///< Paced at the adaptive controller's rate instead of upstream's 80 % of 1 Gbit/s.
+    std::chrono::nanoseconds packet_time {};  ///< Time a packet takes at the adaptive pacing rate.
     std::size_t packets_in_1ms = 1;  ///< Packets sent in a millisecond, at least one.
 
     /**
@@ -39,7 +41,20 @@ namespace stream {
      * @return The offset from the frame's start.
      */
     [[nodiscard]] std::chrono::nanoseconds due(std::size_t packets_sent) const {
+      if (adaptive) {
+        return packet_time * packets_sent;
+      }
       return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(1)) * packets_sent / packets_in_1ms;
+    }
+
+    /**
+     * @brief The packets sent in one batch: no more than a millisecond's worth at the adaptive
+     * pacing rate, or the pacing is lost inside the batch.
+     * @param batch_size The batch upstream allows.
+     * @return The batch size to use.
+     */
+    [[nodiscard]] std::size_t batch_size(std::size_t batch_size) const {
+      return adaptive ? std::min(batch_size, packets_in_1ms) : batch_size;
     }
   };
 
@@ -94,12 +109,18 @@ namespace stream {
   /**
    * @brief The pacing of a frame's packets.
    * @param blocksize Bytes of a packet's payload.
-   * @return Upstream's 80 % of 1 Gbit/s.
+   * @param pacing_bps The adaptive controller's pacing rate, 0 without one.
+   * @return Upstream's 80 % of 1 Gbit/s, or the controller's rate when it is lower.
    */
-  inline pacing_t pacing(std::size_t blocksize) {
+  inline pacing_t pacing(std::size_t blocksize, double pacing_bps) {
     pacing_t result;
     // Around 80 % of 1 Gbit/s: 1 Gbit/s, percent, ms, packet, byte
     result.packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+    if (pacing_bps > 0 && pacing_bps < std::giga::num * 0.8) {
+      result.adaptive = true;
+      result.packet_time = std::chrono::nanoseconds(static_cast<std::int64_t>(static_cast<double>(blocksize) * 8 * 1e9 / pacing_bps));
+      result.packets_in_1ms = std::max<std::int64_t>(1, std::chrono::nanoseconds(std::chrono::milliseconds(1)) / result.packet_time);
+    }
     return result;
   }
 
@@ -126,6 +147,21 @@ namespace stream {
    */
   inline double pay_multiple(double budget_bps, double bitrate_max_bps, double ceiling_multiple) {
     return at_ceiling(budget_bps, bitrate_max_bps) ? std::max(1.1, ceiling_multiple) : 1.1;
+  }
+
+  /**
+   * @brief When a frame is paid for at the adaptive controller's budget.
+   * @param start When the frame's packets started to leave.
+   * @param wire_bytes Bytes the frame took on the wire, headers and parity included.
+   * @param budget_bps The controller's budget, 0 without one.
+   * @param multiple The multiple of the budget the frame is paid at (pay_multiple).
+   * @return The time the next frame waits for (frame_send_timing), or `start` without a budget.
+   */
+  inline std::chrono::steady_clock::time_point paid_until(std::chrono::steady_clock::time_point start, double wire_bytes, double budget_bps, double multiple = 1.1) {
+    if (budget_bps <= 0) {
+      return start;
+    }
+    return start + std::chrono::nanoseconds(static_cast<std::int64_t>(wire_bytes * 8 * 1e9 / (multiple * budget_bps)));
   }
 
   /**

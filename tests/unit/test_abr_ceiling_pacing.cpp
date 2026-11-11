@@ -9,6 +9,8 @@
 // local includes
 #include <src/stream_pacing.h>
 
+using namespace std::chrono_literals;
+
 // @ABR-21-S2
 TEST(AbrCeilingPacingTest, AtTheCeilingTheFrameIsPacedAtTwiceTheBudget) {
   EXPECT_TRUE(stream::at_ceiling(19.8e6, 20e6));
@@ -24,4 +26,8 @@ TEST(AbrCeilingPacingTest, AtTheCeilingTheFrameIsPacedAtTwiceTheBudget) {
 TEST(AbrCeilingPacingTest, AtTheCeilingTheFrameIsPaidAtTwiceTheBudget) {
   EXPECT_DOUBLE_EQ(stream::pay_multiple(10e6, 20e6, 2.0), 1.1);
   EXPECT_DOUBLE_EQ(stream::pay_multiple(20e6, 20e6, 2.0), 2.0);
+  const auto start = std::chrono::steady_clock::time_point {};
+  // 25000 bytes at 2 * 20 Mbit/s: 5 ms
+  EXPECT_EQ(stream::paid_until(start, 25000, 20e6, 2.0) - start, 5ms);
+  EXPECT_EQ(stream::paid_until(start, 25000, 20e6) - start, std::chrono::nanoseconds(static_cast<std::int64_t>(25000 * 8 * 1e9 / 22e6)));
 }

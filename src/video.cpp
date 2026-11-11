@@ -36,6 +36,7 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
+#include "stream.h"
 #include "sync.h"
 #include "video.h"
 #include "video_internal.h"
@@ -2461,6 +2462,38 @@ namespace video {
   }
 
   /**
+   * @brief Apply the latest bitrate requested by the adaptive bitrate controller, if any.
+   *
+   * Runs on the encoder thread between frames, which is the only place the encoder can be
+   * reconfigured safely.
+   *
+   * An encoder that cannot change it says so once, with the bitrate it keeps, so the controller
+   * paces the frame rate instead.
+   *
+   * @param session Running encode session.
+   * @param events Bitrate events for this stream.
+   * @param fixed_events Where to say the encoder keeps its bitrate.
+   * @param fixed_reported Whether that was already said for this encoder.
+   */
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported) {
+    if (!events || !events->peek()) {
+      return;
+    }
+    if (auto kbps = events->pop(0ms)) {
+      if (session.set_bitrate(*kbps)) {
+        BOOST_LOG(debug) << "Encoder bitrate set to "sv << *kbps << " kbps"sv;
+      } else if (!fixed_reported) {
+        fixed_reported = true;
+        const int opened = session.opened_bitrate_kbps();
+        BOOST_LOG(info) << "Encoder cannot change bitrate during the session: keeping "sv << opened << " kbps and pacing the frame rate"sv;
+        if (fixed_events && opened > 0) {
+          fixed_events->raise(opened);
+        }
+      }
+    }
+  }
+
+  /**
    * @brief Tell the stream, once per encoder, how far back it can repair a loss.
    *
    * @param session Active encode session.
@@ -2534,6 +2567,9 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
     auto ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
+    auto bitrate_events = mail->event<int>(mail::bitrate);
+    auto bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
+    bool bitrate_fixed_reported = false;
     auto repair_reach_events = mail->event<int>(mail::repair_reach);
     bool repair_reach_reported = false;
     auto frame_divider_events = mail->event<int>(mail::frame_divider);
@@ -2575,6 +2611,7 @@ namespace video {
         session->request_idr_frame();
       }
 
+      apply_requested_bitrate(*session, bitrate_events, bitrate_fixed_events, bitrate_fixed_reported);
       report_repair_reach(*session, repair_reach_events, repair_reach_reported);
 
       if (frame_divider_events->peek()) {
@@ -3020,6 +3057,7 @@ namespace video {
     // Encoding takes place on this thread
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
+    bool first_open = true;
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
       if (ref->reinit_event.peek()) {
@@ -3038,6 +3076,14 @@ namespace video {
       }
 
       auto &encoder = *chosen_encoder;
+
+      // An encoder reopened mid-session opens at the adaptive bitrate controller's bitrate, not the
+      // client's; the first one keeps the client's, for encoders that cannot change it in place
+      if (!std::exchange(first_open, false)) {
+        if (const int kbps = stream::session::encoder_open_kbps(channel_data); kbps > 0) {
+          config.bitrate = kbps;
+        }
+      }
 
       auto encode_device = make_encode_device(*display, encoder, config);
       if (!encode_device) {

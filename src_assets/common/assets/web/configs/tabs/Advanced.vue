@@ -27,6 +27,7 @@ const config = ref(props.config)
       <select id="adaptive_bitrate" class="form-select" v-model="config.adaptive_bitrate">
         <option value="disabled">{{ $t('config.adaptive_bitrate_disabled') }}</option>
         <option value="fec">{{ $t('config.adaptive_bitrate_fec') }}</option>
+        <option value="full">{{ $t('config.adaptive_bitrate_full') }}</option>
       </select>
       <div class="form-text">{{ $t('config.adaptive_bitrate_desc') }}</div>
     </div>

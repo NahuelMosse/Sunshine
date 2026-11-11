@@ -1830,7 +1830,7 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {0, 100});
-    string_restricted_f(vars, "adaptive_bitrate", stream.adaptive_bitrate, {"disabled"sv, "fec"sv});
+    string_restricted_f(vars, "adaptive_bitrate", stream.adaptive_bitrate, {"disabled"sv, "fec"sv, "full"sv});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
