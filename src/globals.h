@@ -60,7 +60,9 @@ namespace mail {
   MAIL(ltr_ack);  ///< Long-term reference frame the client acknowledged (0x0350).
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
+  MAIL(bitrate);  ///< Target bitrate in kbps requested by the adaptive bitrate controller.
   MAIL(frame_divider);  ///< How many captured frames in a thousand to encode, as the adaptive bitrate controller asks.
+  MAIL(bitrate_fixed);  ///< The encoder cannot change its bitrate during the session: the kbps it keeps.
   MAIL(repair_reach);  ///< How many frames back the encoder can still repair a loss from, without an IDR frame.
 #undef MAIL
 

@@ -203,7 +203,7 @@ namespace {
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto shutdown = mail::man->event<bool>(mail::broadcast_shutdown);
     const auto epoch = std::chrono::steady_clock::now();
-    std::thread sender_thread {stream::videoBroadcastThread, std::ref(sender)};
+    std::thread sender_thread {stream::videoSendThread, std::ref(sender), epoch, nullptr, nullptr};
     video::packet_t frame = std::make_unique<test_packet_t>(&session, 1, bytes);
     frame->frame_timestamp = epoch;
     packets->raise(std::move(frame));
@@ -293,9 +293,39 @@ TEST(AdaptiveBitrateStreamTest, AMalformedMessageWarnsOncePerKind) {
   EXPECT_TRUE(next.malformed(message_e::fec_status)) << "once per session";
 }
 
+// @ABR-22-S2
+TEST(AdaptiveBitrateStreamTest, AnEncoderReopenedInFecModeOpensAtTheClientsBitrate) {
+  adaptive_bitrate::session_t fec {adaptive_bitrate::mode_e::fec, 20000, 60, 1024, 90, 300000.0};
+  feed(fec, std::chrono::steady_clock::now(), 180);
+  EXPECT_EQ(fec.initial_encoder_kbps(), 0) << "fec mode does not move the encoder's bitrate";
+
+  scoped_config_t mode {"fec", 20};
+  auto session = make_session(signals);
+  ASSERT_NE(session.get(), nullptr);
+  EXPECT_EQ(stream::session::encoder_open_kbps(session.get()), 0);
+}
+
+// @ABR-22-S3
+TEST(AdaptiveBitrateStreamTest, TheLatencyOfAFrameNoControllerHoldsIsMeasuredFromNow) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto captured = now - 10ms;
+
+  // The previous frame's packets are still being paced out for 60 ms: upstream reports the time from capture to now
+  const auto stock = stream::frame_send_timing(now, now + 60ms, captured, 0.0, now);
+  EXPECT_EQ(stock.first, now + 60ms) << "the frame still waits for the previous one";
+  ASSERT_TRUE(stock.second.has_value());
+  EXPECT_EQ(*stock.second, 100) << "10 ms in tenths of a millisecond";
+
+  // A frame the controller holds reports the hold as well
+  const auto held = stream::frame_send_timing(now, now + 60ms, captured, 1e6, now + 100ms);
+  EXPECT_EQ(held.first, now + 100ms);
+  ASSERT_TRUE(held.second.has_value());
+  EXPECT_EQ(*held.second, 1100) << "capture to the start of the sending";
+}
+
 // @ABR-22-S3
 TEST(AdaptiveBitrateStreamTest, ASessionThatAnnouncedNothingSendsAFrameOverFourBlocksWithNoParityAsUpstream) {
-  scoped_config_t mode {"fec", 20};
+  scoped_config_t mode {"full", 20};
   auto session = make_session(0);
   ASSERT_NE(session.get(), nullptr);
 

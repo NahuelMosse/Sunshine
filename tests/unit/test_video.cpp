@@ -708,6 +708,7 @@ TEST_F(Libx264SessionTest, WithASingleReferenceTheLossCostsAnIdrFrame) {
 }
 
 namespace video {
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported);
   void report_repair_reach(const encode_session_t &session, safe::mail_raw_t::event_t<int> &events, bool &reported);
 }  // namespace video
 
@@ -740,6 +741,32 @@ TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
     drain_decoder();
     EXPECT_EQ(decoded, frame);
   }
+}
+
+TEST_F(Libx264SessionTest, AppliesTheBitrateTheControllerAsksFor) {
+  open(0);
+  auto events = mail::man->event<int>(mail::bitrate);
+  auto fixed = mail::man->event<int>(mail::bitrate_fixed);
+  bool reported = false;
+
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 6000) << "nothing was asked";
+
+  events->raise(2500);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_EQ(session->opened_bitrate_kbps(), 2500);
+  EXPECT_FALSE(reported);
+  EXPECT_FALSE(fixed->peek());
+
+  // A bitrate the encoder cannot take: it keeps the one it has, and says so once
+  events->raise(0);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_TRUE(reported);
+  ASSERT_TRUE(fixed->peek());
+  EXPECT_EQ(fixed->pop(0ms), 2500);
+  events->raise(0);
+  video::apply_requested_bitrate(*session, events, fixed, reported);
+  EXPECT_FALSE(fixed->peek());
 }
 
 TEST_F(Libx264SessionTest, WithoutTheAdaptiveModesNoReferencesAreAdded) {
@@ -1160,4 +1187,15 @@ TEST_F(EncodeLoopTest, TheEncoderSaysOnceHowFarBackItRepairs) {
   ASSERT_TRUE(packets->pop(5s));
   stop();
   EXPECT_FALSE(reach->peek()) << "the same encoder does not say it again";
+}
+
+TEST_F(EncodeLoopTest, TheEncoderTakesTheBitrateTheControllerAsksFor) {
+  auto bitrate = mail->event<int>(mail::bitrate);
+  bitrate->raise(4000);
+  start();
+  capture(std::chrono::steady_clock::now());
+  auto packet = packets->pop(5s);
+  stop();
+  ASSERT_TRUE(packet);
+  EXPECT_EQ(encoder.current, 4000U) << "before the frame";
 }
