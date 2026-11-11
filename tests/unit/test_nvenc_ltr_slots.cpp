@@ -20,6 +20,7 @@
 #include <boost/asio.hpp>
 
 // local includes
+#include <src/adaptive_bitrate.h>
 #include <src/nvenc/nvenc_ltr.h>
 #include <src/platform/common.h>
 #include <src/rtsp.h>
