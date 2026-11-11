@@ -28,6 +28,8 @@ namespace stream {
   struct config_t {
     audio::config_t audio;  ///< Audio capture configuration for the stream.
     video::config_t monitor;  ///< Video capture and encoder configuration for the selected monitor.
+    int requestedBitrateKbps = 0;  ///< Bitrate the client asked for, before taking out parity, audio and overhead.
+    int ipHeaderBytes = 28;  ///< IP and UDP header bytes of each packet to the client: 28 for IPv4, 48 for IPv6.
 
     int packetsize;  ///< Maximum payload size for network packets.
     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.

@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <ratio>
 
+// lib includes
+#include <boost/asio/ip/address.hpp>
+
 namespace stream {
 
   namespace fec {
@@ -41,6 +44,15 @@ namespace stream {
   };
 
   /**
+   * @brief Bytes of IP and UDP headers on each packet to a client.
+   * @param address The client's address.
+   * @return 28 for IPv4 (an IPv4-mapped IPv6 address is IPv4), 48 for IPv6.
+   */
+  inline int ip_udp_header_bytes(const boost::asio::ip::address &address) {
+    return address.is_v6() && !address.to_v6().is_v4_mapped() ? 48 : 28;
+  }
+
+  /**
    * @brief How a frame is split in FEC blocks.
    */
   struct fec_plan_t {
@@ -52,21 +64,31 @@ namespace stream {
    * @brief The FEC blocks of a frame and the parity percentage they carry.
    *
    * A block holds at most 255 shards, data and parity, and the protocol counts at most four blocks.
-   * A frame that needs more at the wanted percentage goes in four, with no parity.
+   * A frame that needs more at the wanted percentage goes in four. Upstream's stream sends them with no
+   * parity; with `keep_parity` the percentage is lowered to what fits next to the data of the largest
+   * block instead, and parity is dropped only when the data alone fills it.
    *
    * @param payload_bytes Size of the frame's payload, a whole number of packets.
    * @param blocksize Bytes of a packet.
    * @param percentage The wanted parity percentage.
+   * @param keep_parity Whether a frame over four blocks keeps the parity that fits, as the adaptive controller sends it.
    * @return The blocks and the percentage.
    */
-  inline fec_plan_t fec_plan(std::size_t payload_bytes, std::size_t blocksize, int percentage) {
+  inline fec_plan_t fec_plan(std::size_t payload_bytes, std::size_t blocksize, int percentage, bool keep_parity) {
+    constexpr std::size_t max_shards = 255;
     constexpr int max_blocks = 4;
     const auto max_data = static_cast<std::size_t>(fec::max_data_shards(std::max(percentage, 0)));
     const std::size_t blocks_needed = (payload_bytes + max_data * blocksize - 1) / (max_data * blocksize);
     if (blocks_needed <= max_blocks) {
       return {static_cast<int>(std::max<std::size_t>(blocks_needed, 1)), percentage};
     }
-    return {max_blocks, 0};
+    if (!keep_parity) {
+      return {max_blocks, 0};
+    }
+    const std::size_t aligned = ((payload_bytes / max_blocks + blocksize - 1) / blocksize) * blocksize;
+    const std::size_t data = aligned / blocksize;
+    const int fits = data >= max_shards ? 0 : static_cast<int>((max_shards - data) * 100 / data);
+    return {max_blocks, std::min(percentage, fits)};
   }
 
   /**

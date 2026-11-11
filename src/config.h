@@ -274,6 +274,8 @@ namespace config {
     int packetsize;  ///< Maximum payload size for network packets.
 
     bool dscp_tagging;  ///< Allow DSCP tagging of audio and video traffic when requested by the client.
+
+    std::string adaptive_bitrate;  ///< Adaptive bitrate controller mode: disabled, fec or full.
   };
 
   /**

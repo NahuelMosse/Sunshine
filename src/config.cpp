@@ -845,6 +845,8 @@ namespace config {
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
     0,  // packetsize
     true,  // dscp_tagging
+
+    "disabled",  // adaptive_bitrate
   };
 
   /**
@@ -1828,6 +1830,7 @@ namespace config {
 #endif
 
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {0, 100});
+    string_restricted_f(vars, "adaptive_bitrate", stream.adaptive_bitrate, {"disabled"sv, "fec"sv});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 
