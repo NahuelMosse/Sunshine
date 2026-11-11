@@ -58,6 +58,15 @@ namespace audio {
   extern const std::array<opus_stream_config_t, MAX_STREAM_CONFIG> stream_configs;
 
   /**
+   * @brief Select the Opus stream configuration for a channel count and quality tier.
+   *
+   * @param channels Number of audio channels in the stream.
+   * @param quality Whether the high-quality Opus layout should be selected.
+   * @return Index into `stream_configs` for the requested layout.
+   */
+  int map_stream(int channels, bool quality);
+
+  /**
    * @brief Audio capture and encoder settings for a stream.
    */
   struct config_t {

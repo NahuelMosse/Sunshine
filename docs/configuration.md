@@ -2092,6 +2092,43 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Runs a delay-based rate controller on each session, fed by what the client reports.
+            Unless disabled, the host advertises the feature to the client, and the controller acts
+            on a session from its start only when its client announces its signals in its feature
+            flags: loss stats, its clock in the periodic ping, and the arrival of each frame (Frame
+            Stats). A session whose client does not announce them (an official Moonlight) streams as
+            with this option disabled, whatever it sends: the encoder opened as without the
+            controller, the configured FEC, and the control thread waiting up to 150 ms for events.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            disabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td rowspan="3">Choices</td>
+        <td>disabled</td>
+        <td>The controller does not run.</td>
+    </tr>
+    <tr>
+        <td>fec</td>
+        <td>For a client that
+            announces the signals the controller runs, its control thread waits up to 5 ms for events instead of
+            150 ms, to read each round trip, and it also sets the FEC parity of every block, overriding
+            [fec_percentage](#fec_percentage), and the encoder opens with the references it repairs
+            losses from: with NVENC a DPB of min(the level's frames, 5) frames
+            holding 2 long-term references (4 frames at 1080p60 H.264).</td>
+    </tr>
+</table>
+
 ### qp
 
 <table>

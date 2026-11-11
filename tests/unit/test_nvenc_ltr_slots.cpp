@@ -25,6 +25,7 @@
 #include <src/platform/common.h>
 #include <src/rtsp.h>
 #include <src/stream.h>
+#include <src/stream_internal.h>
 #include <src/stream_pacing.h>
 #include <src/video.h>
 

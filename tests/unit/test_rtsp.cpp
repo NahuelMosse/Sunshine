@@ -18,6 +18,7 @@ extern "C" {
 #include "../tests_common.h"
 
 // local includes
+#include <src/config.h>
 #include <src/rtsp.h>
 
 /**
@@ -73,6 +74,15 @@ namespace rtsp_stream {
    * @param req Request to handle.
    */
   void cmd_play(rtsp_server_t *, boost::asio::ip::tcp::socket &sock, launch_session_t &session, msg_t &&req);
+
+  /**
+   * @brief Take the stream configuration a client announces.
+   * @param rtsp_server Server the stream session joins.
+   * @param sock Connected client socket.
+   * @param session Launch session.
+   * @param req Request to handle.
+   */
+  void cmd_announce(rtsp_server_t *rtsp_server, boost::asio::ip::tcp::socket &sock, launch_session_t &session, msg_t &&req);
 }  // namespace rtsp_stream
 
 /**
@@ -114,4 +124,63 @@ TEST(RtspResponseTest, CommonDispatcherPreservesResponsesWithoutServerContext) {
       EXPECT_TRUE(response.ends_with("\r\n\r\n"));
     }
   }
+}
+
+namespace {
+  /**
+   * @brief Send an ANNOUNCE with the given SDP lines and return the response.
+   */
+  std::string announce(std::string sdp) {
+    using boost::asio::ip::tcp;
+    boost::asio::io_context io;
+    tcp::acceptor acceptor {io, {boost::asio::ip::address_v4::loopback(), 0}};
+    tcp::socket client {io};
+    client.connect(acceptor.local_endpoint());
+    auto server_socket = acceptor.accept();
+
+    rtsp_stream::launch_session_t session {};
+    rtsp_stream::msg_t request {new RTSP_MESSAGE {}};
+    request->sequenceNumber = 7;
+    request->payload = sdp.data();
+    request->payloadLength = static_cast<int>(sdp.size());
+    rtsp_stream::cmd_announce(nullptr, server_socket, session, std::move(request));
+    server_socket.shutdown(tcp::socket::shutdown_send);
+
+    std::string response;
+    boost::system::error_code read_error;
+    boost::asio::read(client, boost::asio::dynamic_buffer(response), read_error);
+    EXPECT_EQ(read_error, boost::asio::error::eof);
+    return response;
+  }
+}  // namespace
+
+TEST(RtspAnnounceTest, AnAnnounceWithoutTheStreamAttributesIsABadRequest) {
+  const auto response = announce("v=0\r\ns=client\r\n");
+  EXPECT_TRUE(response.starts_with("RTSP/1.0 400 BAD REQUEST\r\n")) << response;
+  EXPECT_NE(response.find("CSeq: 7\r\n"), std::string::npos);
+}
+
+TEST(RtspAnnounceTest, AClientWithoutEncryptionIsForbiddenWhenItIsMandatory) {
+  const auto saved_lan = config::stream.lan_encryption_mode;
+  const auto saved_wan = config::stream.wan_encryption_mode;
+  config::stream.lan_encryption_mode = config::ENCRYPTION_MODE_MANDATORY;
+  config::stream.wan_encryption_mode = config::ENCRYPTION_MODE_MANDATORY;
+  const auto response = announce(
+    "v=0\r\n"
+    "s=client\r\n"
+    "a=x-nv-audio.surround.numChannels:2\r\n"
+    "a=x-nv-audio.surround.channelMask:3\r\n"
+    "a=x-nv-audio.surround.AudioQuality:0\r\n"
+    "a=x-nv-video[0].packetSize:1024\r\n"
+    "a=x-nv-video[0].clientViewportWd:1280\r\n"
+    "a=x-nv-video[0].clientViewportHt:720\r\n"
+    "a=x-nv-video[0].maxFPS:60\r\n"
+    "a=x-nv-vqos[0].bw.maximumBitrateKbps:20000\r\n"
+    "a=x-nv-video[0].videoEncoderSlicesPerFrame:1\r\n"
+    "a=x-nv-video[0].maxNumReferenceFrames:0\r\n"
+  );
+  config::stream.lan_encryption_mode = saved_lan;
+  config::stream.wan_encryption_mode = saved_wan;
+  EXPECT_TRUE(response.starts_with("RTSP/1.0 403 Forbidden\r\n")) << response;
+  EXPECT_NE(response.find("CSeq: 7\r\n"), std::string::npos);
 }

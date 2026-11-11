@@ -24,6 +24,7 @@ extern "C" {
 }
 
 // local includes
+#include "adaptive_bitrate.h"
 #include "config.h"
 #include "display_device.h"
 #include "globals.h"
@@ -35,6 +36,7 @@ extern "C" {
 #include "process.h"
 #include "stream.h"
 #include "stream_fec.h"
+#include "stream_internal.h"
 #include "stream_pacing.h"
 #include "sync.h"
 #include "system_tray.h"
@@ -45,6 +47,7 @@ constexpr int IDX_START_A = 0;  ///< Control-stream message index for the first 
 constexpr int IDX_START_B = 1;  ///< Control-stream message index for the second stream-start packet.
 constexpr int IDX_INVALIDATE_REF_FRAMES = 2;  ///< Control-stream message index for invalidate ref frames.
 constexpr int IDX_LOSS_STATS = 3;  ///< Control-stream message index for loss stats.
+constexpr int IDX_FRAME_STATS = 4;  ///< Control-stream message index for frame stats.
 constexpr int IDX_INPUT_DATA = 5;  ///< Control-stream message index for input data.
 constexpr int IDX_RUMBLE_DATA = 6;  ///< Control-stream message index for rumble data.
 constexpr int IDX_TERMINATION = 7;  ///< Control-stream message index for termination.
@@ -63,7 +66,7 @@ static const std::array<short, 17> packetTypes = {
   0x0307,  // Start B
   0x0301,  // Invalidate reference frames
   0x0201,  // Loss Stats
-  0x0204,  // Frame Stats (unused)
+  0x0204,  // Frame Stats
   0x0206,  // Input data
   0x010b,  // Rumble data
   0x0109,  // Termination
@@ -87,6 +90,25 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace stream {
+
+  /**
+   * @brief Audio bitrate on the wire assumed by the adaptive bitrate controller.
+   *
+   * Audio shares the bottleneck but is not in the video frame reports. The Opus bitrate of the
+   * negotiated layout, as the SDP advertises it, plus RTP, IP and UDP headers on every packet,
+   * with the parity packets the audio FEC adds.
+   *
+   * @param config The audio the client negotiated.
+   * @param ip_header_bytes IP and UDP header bytes of each packet to the client.
+   * @return Bits per second.
+   */
+  double estimated_audio_bps(const audio::config_t &config, int ip_header_bytes) {
+    const double header_bytes = 12 + ip_header_bytes;
+    const auto &stream = audio::stream_configs[audio::map_stream(config.channels, config.flags[audio::config_t::HIGH_QUALITY])];
+    const double packets_per_second = 1000.0 / (config.packetDuration > 0 ? config.packetDuration : 5);
+    const double fec = double(RTPA_DATA_SHARDS + RTPA_FEC_SHARDS) / RTPA_DATA_SHARDS;
+    return (stream.bitrate + packets_per_second * header_bytes * 8) * fec;
+  }
 
   /**
    * @brief Enumerates supported socket options.
@@ -533,6 +555,8 @@ namespace stream {
       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
       safe::mail_raw_t::event_t<std::uint32_t> ltr_ack_events;  ///< Event carrying the long-term reference frame the client acknowledged.
+      safe::mail_raw_t::event_t<int> repair_reach_events;  ///< Event saying how many frames back the encoder repairs a loss from.
+      safe::mail_raw_t::event_t<int> frame_divider_events;  ///< Event carrying the share of captured frames to encode, in thousandths.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -568,6 +592,8 @@ namespace stream {
       platf::feedback_queue_t feedback_queue;  ///< Queue of controller feedback awaiting control-channel delivery.
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;  ///< Queue of HDR metadata awaiting control-channel delivery.
     } control;  ///< Runtime state for the encrypted GameStream control channel.
+
+    std::unique_ptr<adaptive_bitrate::session_t> adaptive;  ///< Adaptive bitrate controller, if enabled and supported by the client.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
@@ -1136,6 +1162,9 @@ namespace stream {
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
+      if (session->adaptive) {
+        session->adaptive->client_ping(std::chrono::steady_clock::now(), payload);
+      }
     });
 
     server->map(packetTypes[IDX_START_A], [&](session_t *session, const std::string_view &payload) {
@@ -1160,10 +1189,45 @@ namespace stream {
         << "time in milli since last report [" << t.count() << ']' << std::endl
         << "last good frame [" << lastGoodFrame << ']' << std::endl
         << "---end stats---";
+
+      if (session->adaptive && !session->adaptive->loss_stats(std::chrono::steady_clock::now(), payload)) {
+        BOOST_LOG((session->adaptive->malformed(adaptive_bitrate::message_e::loss_stats) ? warning : verbose)) << "Malformed loss stats of "sv << payload.size() << " bytes"sv;
+      }
+    });
+
+    // The arrival of each frame at the client: GameStream reserves this message in every
+    // generation and nothing ever filled it. A client that does not send it leaves the
+    // controller measuring as it does without it.
+    server->map(packetTypes[IDX_FRAME_STATS], [&](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(verbose) << "type [IDX_FRAME_STATS]"sv;
+
+      if (session->adaptive && !session->adaptive->frame_stats(std::chrono::steady_clock::now(), payload)) {
+        BOOST_LOG((session->adaptive->malformed(adaptive_bitrate::message_e::frame_stats) ? warning : verbose)) << "Malformed frame stats of "sv << payload.size() << " bytes"sv;
+      }
+    });
+
+    // The per-frame FEC status the client sends for frames that needed repair. The same value,
+    // 0x5502, is "set RGB LED" in the other direction (packetTypes[IDX_SET_RGB_LED]): this
+    // handler is for the incoming message only.
+    server->map(SS_FRAME_FEC_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(verbose) << "type [SS_FRAME_FEC_STATUS]"sv;
+
+      if (session->adaptive && !session->adaptive->fec_status(payload)) {
+        BOOST_LOG((session->adaptive->malformed(adaptive_bitrate::message_e::fec_status) ? warning : verbose)) << "Malformed FEC status of "sv << payload.size() << " bytes"sv;
+      }
     });
 
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
+      if (session->adaptive) {
+        if (!session->adaptive->idr_requested(std::chrono::steady_clock::now())) {
+          BOOST_LOG(debug) << "IDR frame already on its way"sv;
+          return;
+        }
+        if (auto divider = session->adaptive->take_frame_divider()) {
+          session->video.frame_divider_events->raise(divider);
+        }
+      }
 
       session->video.idr_events->raise(true);
     });
@@ -1179,6 +1243,12 @@ namespace stream {
         << "lastFrame [" << lastFrame << ']';
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+      if (session->adaptive) {
+        session->adaptive->invalidation_requested(std::chrono::steady_clock::now());
+        if (auto divider = session->adaptive->take_frame_divider()) {
+          session->video.frame_divider_events->raise(divider);
+        }
+      }
     });
 
     // moonlight-common-c #122: the client acknowledges each complete frame whose packets carry
@@ -1295,6 +1365,7 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
+      auto wait = adaptive_bitrate::control_wait(nullptr);
 
       {
         auto lg = server->_sessions.lock();
@@ -1350,6 +1421,35 @@ namespace stream {
 
               send_hdr_mode(session, std::move(hdr_info));
             }
+
+            // ENet measures the round trip on the control stream, which crosses the same
+            // bottleneck as the video: queueing shows up in it the way the controller expects.
+            // It only updates it when the host's own reliable commands are acknowledged, so the
+            // host pings on its own schedule; the ping is an ENet command, not a GameStream
+            // message.
+            if (session->adaptive) {
+              wait = std::min(wait, adaptive_bitrate::control_wait(session->adaptive.get()));
+            }
+            if (session->adaptive && session->control.peer) {
+              if (session->video.repair_reach_events->peek()) {
+                if (auto frames = session->video.repair_reach_events->pop(0ms)) {
+                  session->adaptive->encoder_repair_reach(*frames);
+                }
+              }
+              if (session->adaptive->enet_ping_due(now)) {
+                enet_peer_ping(session->control.peer);
+              }
+              if (auto divider = session->adaptive->take_frame_divider()) {
+                session->video.frame_divider_events->raise(divider);
+              }
+              session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0);
+              if (session->adaptive->take_idr_request()) {
+                if (auto divider = session->adaptive->take_frame_divider()) {
+                  session->video.frame_divider_events->raise(divider);
+                }
+                session->video.idr_events->raise(true);
+              }
+            }
           }
 
           ++pos;
@@ -1362,7 +1462,9 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      // ENet processes acknowledgements inside the wait but only returns on an event: once a
+      // session's controller acts, the loop wakes often enough to read each round-trip sample
+      server->iterate(wait);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -1503,6 +1605,53 @@ namespace stream {
    *
    * @param sock Socket used to read or write the protocol message.
    */
+  void videoBroadcastThread(udp::socket &sock);
+
+  /**
+   * @brief What each video packet costs on the wire beyond the payload the client counts.
+   *
+   * @param config The session's stream configuration.
+   * @return Bytes of RTP and video headers, the encryption prefix, and IP and UDP of the client's address family.
+   */
+  int video_wire_overhead(const config_t &config) {
+    return MAX_RTP_HEADER_SIZE + (int) sizeof(NV_VIDEO_PACKET) +
+           ((config.encryptionFlagsEnabled & SS_ENC_VIDEO) ? (int) sizeof(video_packet_enc_prefix_t) : 0) +
+           config.ipHeaderBytes;
+  }
+
+  /**
+   * @brief Report a sent frame to the adaptive bitrate controller.
+   *
+   * @param session The session the frame belongs to.
+   * @param packet The frame.
+   * @param first_send When the first packet actually left, if any did.
+   * @param last_send When the last batch left.
+   * @param packets Packets sent, parity included.
+   * @param data_packets Data packets sent.
+   * @param rtp_bytes RTP bytes sent.
+   * @param wire_bytes Bytes on the wire, headers included.
+   */
+  void report_frame(session_t &session, video::packet_raw_t &packet, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes) {
+    if (session.adaptive && first_send) {
+      if (packet.frame_timestamp) {
+        session.adaptive->host_delay(*first_send - *packet.frame_timestamp);
+      }
+      session.adaptive->frame_sent((uint32_t) packet.frame_index(), *first_send, last_send, packets, data_packets, rtp_bytes, wire_bytes);
+    }
+  }
+
+  /**
+   * @brief Set where a session's video goes and from which local address.
+   *
+   * @param session The session.
+   * @param peer The client's video endpoint.
+   * @param local The local address the packets leave from.
+   */
+  void set_video_route(session_t &session, const udp::endpoint &peer, const boost::asio::ip::address &local) {
+    session.video.peer = peer;
+    session.localAddress = local;
+  }
+
   void videoBroadcastThread(udp::socket &sock) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
@@ -1578,7 +1727,10 @@ namespace stream {
         frame_header.frame_processing_latency = 0;
       }
 
-      auto fecPercentage = config::stream.fec_percentage;
+      // The controller's decisions are read once, so the frame is sized on one consistent set
+      const auto decision = session->adaptive ? session->adaptive->decision() : nullptr;
+
+      auto fecPercentage = session->adaptive ? session->adaptive->fec_percentage(config::stream.fec_percentage, *decision) : config::stream.fec_percentage;
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -1591,10 +1743,15 @@ namespace stream {
       constexpr auto MAX_FEC_BLOCKS = 4;
 
       // The blocks the frame needs at the wanted percentage, at most the protocol's four. An
-      // abnormally large frame (over 800 packets at 20%) goes in four with no FEC.
-      const auto plan = fec_plan(payload.size(), blocksize, fecPercentage);
+      // abnormally large frame (over 800 packets at 20%) goes in four with no FEC, and with the
+      // adaptive controller with the percentage lowered to what fits next to its data.
+      const auto plan = fec_plan(payload.size(), blocksize, fecPercentage, session->adaptive != nullptr);
       if (plan.percentage != fecPercentage) {
-        BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame"sv;
+        if (plan.percentage == 0) {
+          BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame"sv;
+        } else {
+          BOOST_LOG(warning) << "Lowering FEC from "sv << fecPercentage << "% to "sv << plan.percentage << "% for abnormally large encoded frame"sv;
+        }
         fecPercentage = plan.percentage;
       }
       const std::size_t fec_blocks_needed = plan.blocks;
@@ -1647,6 +1804,14 @@ namespace stream {
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
 
+        // When this frame's packets actually left, for the adaptive bitrate controller
+        std::optional<std::chrono::steady_clock::time_point> frame_first_send;
+        std::chrono::steady_clock::time_point frame_last_send;
+        int frame_packets = 0;
+        int frame_data_packets = 0;
+        double frame_rtp_bytes = 0;
+        double frame_wire_bytes = 0;
+
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto payload_packets = (current_payload.size() + (blocksize - 1)) / blocksize;
@@ -1671,9 +1836,19 @@ namespace stream {
             }
           }
 
+          // The adaptive controller sizes the parity of each block on its own
+          auto block_fec_percentage = fecPercentage;
+          if (session->adaptive && fecPercentage > 0) {
+            const int pct = session->adaptive->block_fec_percentage((int) payload_packets, packet->after_ref_frame_invalidation || packet->is_idr(), *decision);
+            if (pct >= 0) {
+              block_fec_percentage = pct;
+            }
+          }
+
           frame_fec_latency_logger.first_point_now();
           // If video encryption is enabled, we allocate space for the encryption header before each shard
-          auto shards = fec::encode(current_payload, blocksize, fecPercentage, session->config.minRequiredFecPackets, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
+          const auto min_parity = session->adaptive ? session->adaptive->min_parity(session->config.minRequiredFecPackets, *decision) : session->config.minRequiredFecPackets;
+          auto shards = fec::encode(current_payload, blocksize, block_fec_percentage, min_parity, session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0);
           frame_fec_latency_logger.second_point_now_and_log();
 
           auto peer_address = session->video.peer.address();
@@ -1759,6 +1934,10 @@ namespace stream {
               batch_info.block_offset = next_shard_to_send;
               batch_info.block_count = current_batch_size;
 
+              if (!frame_first_send) {
+                frame_first_send = std::chrono::steady_clock::now();
+              }
+
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
@@ -1780,6 +1959,7 @@ namespace stream {
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
+              frame_last_send = std::chrono::steady_clock::now();
 
               ratecontrol_group_packets_sent += current_batch_size;
               ratecontrol_frame_packets_sent += current_batch_size;
@@ -1798,11 +1978,18 @@ namespace stream {
                              << (packet->is_idr() ? " Key" : "")
                              << (packet->after_ref_frame_invalidation ? " RFI" : "");
 
+          frame_packets += (int) shards.size();
+          frame_data_packets += (int) shards.data_shards;
+          frame_rtp_bytes += (double) shards.size() * blocksize;
+          frame_wire_bytes += (double) shards.size() * (blocksize + shards.prefixsize + session->config.ipHeaderBytes);
+
           ++blockIndex;
           lowseq += shards.size();
         });
 
         session->video.lowseq = lowseq;
+
+        report_frame(*session, *packet, frame_first_send, frame_last_send, frame_packets, frame_data_packets, frame_rtp_bytes, frame_wire_bytes);
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -2289,6 +2476,36 @@ namespace stream {
 
       session->config = config;
 
+      // The controller needs the per-frame FEC status, and acts from the start only for a client that
+      // announces its other signals (adaptive_bitrate::announces_signals); otherwise the stream is as
+      // without it.
+      auto adaptive_mode = adaptive_bitrate::mode_from_string(config::stream.adaptive_bitrate);
+      if (adaptive_mode != adaptive_bitrate::mode_e::disabled) {
+        if (adaptive_bitrate::session_wanted(adaptive_mode, config.mlFeatureFlags)) {
+          // Payload the controller counts per packet, and what each packet costs on the
+          // wire on top of it
+          const int payload = config.packetsize - (int) sizeof(NV_VIDEO_PACKET);
+          const int overhead = video_wire_overhead(config);
+          session->adaptive = std::make_unique<adaptive_bitrate::session_t>(
+            adaptive_mode,
+            // The controller's budget covers everything on the wire, so it starts from what the
+            // client asked for, not from the encoder bitrate already reduced for parity and audio
+            config.requestedBitrateKbps > 0 ? config.requestedBitrateKbps : config.monitor.bitrate,
+            config.monitor.framerate,
+            payload,
+            overhead,
+            estimated_audio_bps(config.audio, config.ipHeaderBytes),
+            session->config.minRequiredFecPackets,
+            adaptive_bitrate::announces_signals(config.mlFeatureFlags)
+          );
+          // The first encoder already has the references the controller repairs from
+          session->config.monitor.adaptiveRepairs = true;
+          BOOST_LOG(info) << "Adaptive bitrate enabled ["sv << config::stream.adaptive_bitrate << ']';
+        } else {
+          BOOST_LOG(debug) << "Adaptive bitrate is enabled but the client does not announce its signals; streaming as without it"sv;
+        }
+      }
+
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
       session->control.hdr_queue = mail->event<video::hdr_info_t>(mail::hdr);
@@ -2301,6 +2518,8 @@ namespace stream {
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
+      session->video.repair_reach_events = mail->event<int>(mail::repair_reach);
+      session->video.frame_divider_events = mail->event<int>(mail::frame_divider);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {

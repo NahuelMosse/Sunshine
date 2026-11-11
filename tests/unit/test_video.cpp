@@ -657,6 +657,60 @@ struct Libx264SessionTest: PlatformTestSuite {
   int decoded = 0;
 };
 
+// @ABR-20-S3
+TEST_F(Libx264SessionTest, ALossCostsAnIdrFrameWhateverTheReferences) {
+  open(8);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 8; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+    EXPECT_FALSE(packet->after_ref_frame_invalidation);
+  }
+
+  // The client lost frames 8 and 9: libx264 has no invalidation, as upstream, so the answer is a keyframe
+  session->invalidate_ref_frames(8, 9);
+  auto repaired = encode_next();
+  ASSERT_TRUE(repaired);
+  EXPECT_TRUE(repaired->is_idr()) << "several references or not, libx264 answers a loss with an IDR frame";
+  EXPECT_FALSE(repaired->after_ref_frame_invalidation);
+
+  // The stream decodes across the keyframe, and goes on with plain frames after it
+  for (int i = 0; i < 3; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+  }
+  if (decoder) {
+    avcodec_send_packet(decoder.get(), nullptr);
+    drain_decoder();
+    EXPECT_EQ(decoded, frame);
+  }
+}
+
+TEST_F(Libx264SessionTest, WithASingleReferenceTheLossCostsAnIdrFrame) {
+  open(1);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  EXPECT_TRUE(first->is_idr());
+  for (int i = 0; i < 3; ++i) {
+    auto packet = encode_next();
+    ASSERT_TRUE(packet);
+    EXPECT_FALSE(packet->is_idr());
+  }
+  session->invalidate_ref_frames(2, 3);
+  auto repaired = encode_next();
+  ASSERT_TRUE(repaired);
+  EXPECT_TRUE(repaired->is_idr()) << "one reference cannot be dropped without losing the picture";
+  EXPECT_FALSE(repaired->after_ref_frame_invalidation);
+}
+
+namespace video {
+  void report_repair_reach(const encode_session_t &session, safe::mail_raw_t::event_t<int> &events, bool &reported);
+}  // namespace video
+
 TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
   open(0);
   EXPECT_EQ(session->opened_bitrate_kbps(), 6000);
@@ -688,10 +742,40 @@ TEST_F(Libx264SessionTest, ChangesTheBitrateOfARunningSession) {
   }
 }
 
+TEST_F(Libx264SessionTest, WithoutTheAdaptiveModesNoReferencesAreAdded) {
+  const auto saved = config::stream.adaptive_bitrate;
+  config::stream.adaptive_bitrate = "disabled";
+  open(0);
+  auto first = encode_next(true);
+  ASSERT_TRUE(first);
+  for (int i = 0; i < 5; ++i) {
+    ASSERT_TRUE(encode_next());
+  }
+  session->invalidate_ref_frames(5, 6);
+  auto repaired = encode_next();
+  EXPECT_TRUE(repaired) << "whatever libx264 keeps by default, the frame that follows decodes";
+  config::stream.adaptive_bitrate = saved;
+}
+
 // @ABR-01-S2 @ABR-01-S9 @ABR-18-S9
 TEST_F(Libx264SessionTest, ReportsNoRepairReachWithoutLongTermReferences) {
+  const auto saved = config::stream.adaptive_bitrate;
+  config::stream.adaptive_bitrate = "disabled";
   open(0);
+  config::stream.adaptive_bitrate = saved;
   EXPECT_EQ(session->repair_reach_frames(), 0);
+
+  auto events = mail::man->event<int>(mail::repair_reach);
+  while (events->peek()) {
+    events->pop(0ms);
+  }
+  bool reported = false;
+  video::report_repair_reach(*session, events, reported);
+  EXPECT_TRUE(reported) << "the encoder was asked once";
+  ASSERT_TRUE(events->peek()) << "an encoder without long-term references says so: the reach of the one before no longer holds";
+  EXPECT_EQ(events->pop(0ms), 0);
+  video::report_repair_reach(*session, events, reported);
+  EXPECT_FALSE(events->peek());
 }
 
 namespace {
@@ -1061,4 +1145,19 @@ TEST_F(EncodeLoopTest, ASkippedImageGoesOutWhenNoNewerOneArrivesInTime) {
   stop();
   ASSERT_TRUE(encoded) << "the skipped image never went out";
   EXPECT_EQ(*encoded, captured);
+}
+
+TEST_F(EncodeLoopTest, TheEncoderSaysOnceHowFarBackItRepairs) {
+  auto reach = mail->event<int>(mail::repair_reach);
+  start();
+  const auto t0 = std::chrono::steady_clock::now();
+  capture(t0);
+  ASSERT_TRUE(packets->pop(5s));
+  ASSERT_TRUE(reach->peek());
+  EXPECT_EQ(reach->pop(0ms), 30);
+
+  capture(t0 + 16ms);
+  ASSERT_TRUE(packets->pop(5s));
+  stop();
+  EXPECT_FALSE(reach->peek()) << "the same encoder does not say it again";
 }

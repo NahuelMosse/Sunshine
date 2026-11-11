@@ -33,15 +33,6 @@ namespace audio {
   static void stop_audio_control(audio_ctx_t &);
   static void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params);
 
-  /**
-   * @brief Select the Opus stream configuration for a channel count and quality tier.
-   *
-   * @param channels Number of audio channels in the stream.
-   * @param quality Whether the high-quality Opus layout should be selected.
-   * @return Index into `stream_configs` for the requested layout.
-   */
-  int map_stream(int channels, bool quality);
-
   constexpr auto SAMPLE_RATE = 48000;  ///< Audio sample rate in hertz required by Opus.
 
   // NOTE: If you adjust the bitrates listed here, make sure to update the
