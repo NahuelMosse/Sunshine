@@ -37,6 +37,7 @@ extern "C" {
 #include "sync.h"
 #include "video.h"
 #include "video_capture_groups.h"
+#include "video_internal.h"
 
 #ifdef _WIN32
 extern "C" {
@@ -534,6 +535,63 @@ namespace video {
       request_idr_frame();
     }
 
+    /**
+     * @brief Whether the bitrate can be changed by editing the codec context between frames.
+     *
+     * FFmpeg has no general API for this. The libx264 wrapper compares the context with what the
+     * encoder was configured with on every frame and reconfigures it in place when they differ.
+     * The NVENC wrapper does too, but resets the encoder and forces an IDR frame to do it, and the
+     * QuickSync one drains and resets it; AMF, VAAPI, Vulkan, VideoToolbox, MediaFoundation,
+     * libx265 and SVT-AV1 ignore the change. All of those report it as unsupported.
+     *
+     * @return True for libx264.
+     */
+    bool can_change_bitrate() const override {
+      return avcodec_ctx && avcodec_ctx->codec && std::string_view {avcodec_ctx->codec->name} == "libx264"sv;
+    }
+
+    /**
+     * @brief Change the bitrate by editing the codec context between frames.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder will pick up the change.
+     */
+    bool set_bitrate(int kbps) override {
+      if (!can_change_bitrate() || kbps <= 0) {
+        return false;
+      }
+
+      auto &ctx = *avcodec_ctx;
+      const int64_t bitrate = int64_t(kbps) * 1000;
+      const int64_t previous = ctx.rc_max_rate > 0 ? ctx.rc_max_rate : ctx.bit_rate;
+      if (previous <= 0 || previous == bitrate) {
+        return previous == bitrate;
+      }
+
+      // Keep every rate-control field in the same proportion it was opened with: the
+      // one-off difference between bit_rate and rc_max_rate that forces VBR, and the VBV
+      // size in frames
+      const int64_t vbr_offset = ctx.rc_max_rate - ctx.bit_rate;
+      ctx.rc_max_rate = bitrate;
+      ctx.bit_rate = bitrate - vbr_offset;
+      if (ctx.rc_min_rate > 0) {
+        ctx.rc_min_rate = bitrate;
+      }
+      if (ctx.rc_buffer_size > 0) {
+        ctx.rc_buffer_size = static_cast<int>(int64_t(ctx.rc_buffer_size) * bitrate / previous);
+      }
+      return true;
+    }
+
+    /**
+     * @brief The bitrate of the codec context.
+     *
+     * @return Kilobits per second.
+     */
+    int bitrate_kbps() const override {
+      return avcodec_ctx ? static_cast<int>((avcodec_ctx->rc_max_rate > 0 ? avcodec_ctx->rc_max_rate : avcodec_ctx->bit_rate) / 1000) : 0;
+    }
+
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
@@ -603,6 +661,34 @@ namespace video {
       if (!device->nvenc->invalidate_ref_frames(first_frame, last_frame)) {
         force_idr = true;
       }
+    }
+
+    /**
+     * @brief Change the bitrate of the NVENC encoder.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder applied it.
+     */
+    bool set_bitrate(int kbps) override {
+      return device && device->nvenc && kbps > 0 && device->nvenc->set_bitrate(static_cast<std::uint32_t>(kbps));
+    }
+
+    /**
+     * @brief Whether the NVENC encoder can change its bitrate.
+     *
+     * @return True when the GPU supports it.
+     */
+    bool can_change_bitrate() const override {
+      return device && device->nvenc && device->nvenc->can_change_bitrate();
+    }
+
+    /**
+     * @brief The bitrate the NVENC encoder runs at.
+     *
+     * @return Kilobits per second, or 0 without an NVENC encoder.
+     */
+    int bitrate_kbps() const override {
+      return device && device->nvenc ? static_cast<int>(device->nvenc->bitrate_kbps()) : 0;
     }
 
     /**

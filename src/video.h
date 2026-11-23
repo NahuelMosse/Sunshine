@@ -551,6 +551,39 @@ namespace video {
      * @param last_frame Last frame.
      */
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
+
+    /**
+     * @brief Change the target bitrate of the running encoder.
+     *
+     * The bitrate is applied as given: `config::video.max_bitrate` is for the caller to apply.
+     *
+     * @param kbps New target bitrate in kilobits per second.
+     * @return True when the encoder applied it; false when it cannot change bitrate
+     *         without being recreated.
+     */
+    virtual bool set_bitrate([[maybe_unused]] int kbps) {
+      return false;
+    }
+
+    /**
+     * @brief Whether the running encoder can change its bitrate at all.
+     *
+     * A `set_bitrate()` that fails on an encoder that can is a failed call, not a fixed bitrate.
+     *
+     * @return True when `set_bitrate()` is supported.
+     */
+    virtual bool can_change_bitrate() const {
+      return false;
+    }
+
+    /**
+     * @brief The bitrate the encoder runs at: the one it was opened with until `set_bitrate()` succeeds.
+     *
+     * @return Kilobits per second, or 0 when unknown.
+     */
+    virtual int bitrate_kbps() const {
+      return 0;
+    }
   };
 
   // encoders
