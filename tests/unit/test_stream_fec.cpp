@@ -7,6 +7,7 @@
 
 // standard includes
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -183,4 +184,30 @@ TEST(StreamFecTest, WithoutFecLeavesTheDataAlone) {
   auto fec = stream::fec::encode(payload, block_size, 0, 8, 0);
 
   expect_no_parity(fec, 10);
+}
+
+TEST(StreamFecPlanTest, SplitsAFrameInTheBlocksThatFitTheShardLimit) {
+  constexpr std::size_t blocksize = 1400;
+
+  auto plan = stream::fec::plan_blocks(100 * blocksize, blocksize, 20);
+  EXPECT_EQ(plan.blocks, 1U);
+  EXPECT_EQ(plan.percentage, 20);
+
+  plan = stream::fec::plan_blocks(600 * blocksize, blocksize, 20);
+  EXPECT_EQ(plan.blocks, 3U) << "212 data shards fit a block at 20 %";
+  EXPECT_EQ(plan.blocks_needed, 3U);
+  EXPECT_EQ(plan.percentage, 20);
+}
+
+TEST(StreamFecPlanTest, SendsAFrameOverTheBlockLimitWithoutParity) {
+  constexpr std::size_t blocksize = 1400;
+
+  auto plan = stream::fec::plan_blocks(900 * blocksize, blocksize, 20);
+  EXPECT_EQ(plan.blocks, static_cast<std::size_t>(stream::fec::MAX_FEC_BLOCKS));
+  EXPECT_EQ(plan.blocks_needed, 5U);
+  EXPECT_EQ(plan.percentage, 0);
+
+  plan = stream::fec::plan_blocks(900 * blocksize, blocksize, 0);
+  EXPECT_EQ(plan.blocks, static_cast<std::size_t>(stream::fec::MAX_FEC_BLOCKS));
+  EXPECT_EQ(plan.percentage, 0);
 }
