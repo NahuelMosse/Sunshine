@@ -2159,7 +2159,11 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             flags: loss stats, its clock in the periodic ping, and the arrival of each frame (Frame
             Stats). A session whose client does not announce them (an official Moonlight) streams as
             with this option disabled, whatever it sends: the encoder opened as without the
-            controller, the configured FEC, and the control thread waiting up to 150 ms for events.
+            controller, the configured FEC, the shared video sender with its pacing, and the control
+            thread waiting up to 150 ms for events.
+            @note{Only Windows NVENC (on GPUs that report dynamic bitrate change) and libx264 change
+            their bitrate during a session. Every other encoder keeps the bitrate it opened with, and
+            the controller encodes a share of the captured frames instead (the frame divider).}
         </td>
     </tr>
     <tr>
@@ -2169,7 +2173,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             @endcode</td>
     </tr>
     <tr>
-        <td rowspan="3">Choices</td>
+        <td rowspan="4">Choices</td>
         <td>disabled</td>
         <td>The controller does not run.</td>
     </tr>
@@ -2183,6 +2187,15 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
             and the encoder opens with the references it repairs
             losses from: with NVENC a DPB of min(the level's frames, 5) frames
             holding 2 long-term references (4 frames at 1080p60 H.264).</td>
+    </tr>
+    <tr>
+        <td>full</td>
+        <td>Like fec, and for a client that announces the signals the controller also changes the encoder bitrate
+            (Windows NVENC and libx264) or the share of frames encoded (every other encoder), paces
+            each frame at its budget, and sends the session's video from a sender thread of its own. The budget
+            never goes above the bitrate the client asked for. While frames are skipped, the encoder is asked
+            for its image budget divided by the share of frames it encodes, which can be above that bitrate:
+            the encoder spreads its bitrate over every frame it was opened for, and only that share is sent.</td>
     </tr>
 </table>
 

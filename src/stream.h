@@ -96,5 +96,12 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+    /**
+     * @brief Bitrate an encoder reopened during the session opens at.
+     *
+     * @param session Streaming session the encoder belongs to, or nullptr.
+     * @return The adaptive bitrate controller's current request in kbps, or 0 to open at the client's bitrate.
+     */
+    int encoder_open_kbps(const session_t *session);
   }  // namespace session
 }  // namespace stream

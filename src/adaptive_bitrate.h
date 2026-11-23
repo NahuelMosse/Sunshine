@@ -300,6 +300,16 @@ namespace adaptive_bitrate {
     }
 
     /**
+     * @brief The host delay the controller counts, as `host_delay()` recorded it. Only the tests read it.
+     *
+     * @return Seconds.
+     */
+    double host_delay_s() const {
+      std::lock_guard lg {lock};
+      return measured.host_delay_s;
+    }
+
+    /**
      * @brief Handle an SS_FRAME_FEC_STATUS message from the client.
      *
      * Moonlight sends one for every frame (or FEC block) that needed parity to recover or
@@ -732,17 +742,6 @@ namespace adaptive_bitrate {
      */
     double budget_bps(const decision_t &decision) const {
       return mode == mode_e::full ? decision.budget : 0.0;
-    }
-
-    /**
-     * @brief The multiple of the budget the stream pays its frames at (`stream::pay_multiple`).
-     *
-     * 1.1, and `tun::kPaceMax` while the budget sits at the application's ceiling.
-     *
-     * @return The multiple.
-     */
-    double pay_multiple() const {
-      return published.load()->pay_multiple;
     }
 
     /**
