@@ -60,6 +60,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    bool acknowledgesLtr = false;  ///< The client acknowledges the long-term references it decodes: open the encoder with the ones a repair predicts from.
   };
 
   /**
@@ -553,6 +554,15 @@ namespace video {
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
 
     /**
+     * @brief Take the client's acknowledgement of a long-term reference frame (0x0350); only
+     * NVENC marks them.
+     *
+     * @param frame_index The acknowledged frame's 32-bit index.
+     */
+    virtual void acknowledge_ltr([[maybe_unused]] std::uint32_t frame_index) {
+    }
+
+    /**
      * @brief Change the target bitrate of the running encoder.
      *
      * The bitrate is applied as given: `config::video.max_bitrate` is for the caller to apply.
@@ -582,6 +592,16 @@ namespace video {
      * @return Kilobits per second, or 0 when unknown.
      */
     virtual int bitrate_kbps() const {
+      return 0;
+    }
+
+    /**
+     * @brief How many frames back the encoder can repair a loss from without an IDR frame,
+     *        beyond its short-term references.
+     *
+     * @return Frames, or 0 when only the short-term references can repair.
+     */
+    virtual int repair_reach_frames() const {
       return 0;
     }
   };
@@ -665,6 +685,7 @@ namespace video {
     std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
     stream::session_t *channel_data = nullptr;  ///< Stream session that receives this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
+    bool ltr_frame = false;  ///< Whether the encoder marked the frame as a long-term reference.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
   };
 

@@ -526,6 +526,7 @@ namespace stream {
 
       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
+      safe::mail_raw_t::event_t<std::uint32_t> ltr_ack_events;  ///< Event carrying the long-term reference frame the client acknowledged.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
     } video;  ///< Video worker thread state for the active stream.
@@ -1203,6 +1204,18 @@ namespace stream {
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 
+    // The client acknowledges each complete frame whose packets carry the long-term reference flag
+    server->map(SS_LTR_FRAME_ACK_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < sizeof(SS_LTR_FRAME_ACK)) {
+        BOOST_LOG(debug) << "type [SS_LTR_FRAME_ACK]: malformed payload of "sv << payload.size() << " bytes"sv;
+        return;
+      }
+
+      SS_LTR_FRAME_ACK ack;
+      std::memcpy(&ack, payload.data(), sizeof(ack));
+      session->video.ltr_ack_events->raise(util::endian::little(ack.frameIndex));
+    });
+
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
@@ -1723,6 +1736,7 @@ namespace stream {
             auto *inspect = (video_packet_raw_t *) &current_payload[x * blocksize];
 
             inspect->packet.frameIndex = (uint32_t) packet->frame_index();
+            inspect->packet.extraFlags = packet->ltr_frame ? NV_VIDEO_PACKET_EXTRA_FLAG_LTR_FRAME : 0;
             inspect->packet.streamPacketIndex = ((uint32_t) lowseq + x) << 8;
 
             // Match multiFecFlags with Moonlight
@@ -2366,6 +2380,7 @@ namespace stream {
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
+      session->video.ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
