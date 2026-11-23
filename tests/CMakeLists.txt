@@ -32,6 +32,11 @@ if(SUNSHINE_LLVM_COVERAGE)
 else()
     set(CMAKE_CXX_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
     set(CMAKE_C_FLAGS "-fprofile-arcs -ftest-coverage -ggdb -O0")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # Threads racing on plain counters leave negative hits that gcovr rejects (gcc bug 68080)
+        string(APPEND CMAKE_CXX_FLAGS " -fprofile-update=atomic")
+        string(APPEND CMAKE_C_FLAGS " -fprofile-update=atomic")
+    endif()
 endif()
 
 set(SUNSHINE_TEST_GCOV_ROOT
