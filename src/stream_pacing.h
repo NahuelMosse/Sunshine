@@ -11,6 +11,9 @@
 #include <cstddef>
 #include <ratio>
 
+// lib includes
+#include <boost/asio/ip/address.hpp>
+
 namespace stream {
 
   /**
@@ -29,6 +32,15 @@ namespace stream {
       return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(1)) * packets_sent / std::max<std::size_t>(packets_in_1ms, 1);
     }
   };
+
+  /**
+   * @brief Bytes of IP and UDP headers on each packet to a client.
+   * @param address The client's address.
+   * @return 28 for IPv4 (an IPv4-mapped IPv6 address is IPv4), 48 for IPv6.
+   */
+  inline int ip_udp_header_bytes(const boost::asio::ip::address &address) {
+    return address.is_v6() && !address.to_v6().is_v4_mapped() ? 48 : 28;
+  }
 
   /**
    * @brief The pacing of the packets of a frame: around 80 % of 1 Gbit/s.
