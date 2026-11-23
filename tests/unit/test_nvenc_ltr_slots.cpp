@@ -10,6 +10,7 @@
 #include <cstdint>
 
 // local includes
+#include <src/adaptive_bitrate.h>
 #include <src/nvenc/nvenc_ltr.h>
 
 using nvenc::ltr_slot_t;
