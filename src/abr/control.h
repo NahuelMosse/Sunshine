@@ -524,6 +524,8 @@ namespace abr {
     double t_way_back_lift_ = -1e9;  // the last time a proof trusted on the way back lifted the budget
     bool return_refuted_ = false;  // a cut followed such a lift: the pipe from before is not back
     double t_reexplore_ = -1e9;  // when the current fast re-exploration began
+    double t_early_ = -1e9;  // last step of an early re-exploration
+    double early_block_until_ = -1e9;  // an early re-exploration that ended in a cut is not tried again until then
     double reexplore_wait_ = 0;  // how long without queue before re-exploring fast; 0 means kReexploreS
     double budget_before_cut_ = 0;  // the budget before the cut episode that ended at t_cut_
     double pipe_before_cut_ = 0;  // the pipe that delivered what arrived before that cut episode
