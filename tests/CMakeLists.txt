@@ -281,7 +281,7 @@ target_link_options(${PROJECT_NAME} PRIVATE ${SUNSHINE_LINK_OPTIONS})
 
 if (WIN32)
     # Compile the utility tests with the SDK 13.1 implementation namespace and headers.
-    set_source_files_properties(unit/test_nvenc_utils.cpp unit/test_nvenc_bitrate.cpp PROPERTIES
+    set_source_files_properties(unit/test_nvenc_utils.cpp unit/test_nvenc_bitrate.cpp unit/test_nvenc_ltr.cpp PROPERTIES
             COMPILE_DEFINITIONS "NVENC_NAMESPACE=nvenc_1301;NVENC_SDK_VERSION=1301"
             INCLUDE_DIRECTORIES "${NV_CODEC_HEADERS_13_1_INCLUDE_DIR}")
 
