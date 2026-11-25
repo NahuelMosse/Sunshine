@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -88,4 +89,44 @@ namespace stream::fec {
    * @return The shards of the block and the percentage actually applied.
    */
   fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize);
+
+  /// Most FEC blocks a frame can be split in: the packet header has 2 bits for the block count.
+  constexpr int MAX_FEC_BLOCKS = 4;
+
+  /**
+   * @brief Limit data shards so data and parity fit in an 8-bit Reed-Solomon block.
+   *
+   * @param percentage Recovery-shard percentage between 0 and 100.
+   * @return Maximum data shards with room for the requested parity shards.
+   */
+  int max_data_shards(int percentage);
+
+  /**
+   * @brief How a frame is split in FEC blocks.
+   */
+  struct block_plan_t {
+    std::size_t blocks_needed;  ///< Blocks the frame needs at the requested percentage.
+    std::size_t blocks;  ///< Blocks the frame is split in, at most MAX_FEC_BLOCKS.
+    int percentage;  ///< Parity percentage of each block: 0 when the frame needs more than MAX_FEC_BLOCKS.
+  };
+
+  /**
+   * @brief Split a frame in the FEC blocks it needs.
+   *
+   * Each block holds at most max_data_shards() packets. A frame that needs more than MAX_FEC_BLOCKS
+   * blocks goes in MAX_FEC_BLOCKS blocks without parity.
+   *
+   * @param payload_bytes Size of the frame's payload.
+   * @param blocksize Bytes in each packet.
+   * @param percentage The requested parity percentage.
+   * @return The blocks and the percentage they carry.
+   */
+  inline block_plan_t plan_blocks(std::size_t payload_bytes, std::size_t blocksize, int percentage) {
+    const auto max_data_bytes = static_cast<std::size_t>(std::max(max_data_shards(percentage), 1)) * blocksize;
+    const auto blocks_needed = (payload_bytes + max_data_bytes - 1) / max_data_bytes;
+    if (blocks_needed > MAX_FEC_BLOCKS) {
+      return {blocks_needed, MAX_FEC_BLOCKS, 0};
+    }
+    return {blocks_needed, blocks_needed, percentage};
+  }
 }  // namespace stream::fec
