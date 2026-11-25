@@ -44,6 +44,7 @@ namespace abr {
       int data_packets = 0;  ///< of those, the data ones: the rest is the parity that went out
       double rtp_bytes = 0;  ///< what the client will count of those packets
       double wire_bytes = 0;  ///< that plus IP, UDP and encryption: what the bottleneck charges for
+      bool padded = false;  ///< a padded probe: its extra parity is a measurement, not protection against loss
     };
 
     /**

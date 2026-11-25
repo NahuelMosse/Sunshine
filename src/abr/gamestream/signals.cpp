@@ -25,9 +25,12 @@ namespace abr {
       if (c.packets > 0) {
         bits_data_ += c.wire_bytes * 8.0 * c.data_packets / c.packets;
       }
-      packets_tx_ += c.packets;
+      // The parity of a padded probe is not protection and is not asked of the loss: it counts as wire load only.
+      if (!c.padded) {
+        packets_tx_ += c.packets;
+        data_tx_ += c.data_packets;
+      }
       frames_tx_ += 1;
-      data_tx_ += c.data_packets;
       packets_per_frame_ = packets_per_frame_ > 0 ? packets_per_frame_ + kPacketsPerFrameGain * (c.packets - packets_per_frame_) : c.packets;
       for (auto it = sent_.begin(); it != sent_.end();) {
         if (c.t_first_us - it->second.t_first_us > kRetentionUs) {
@@ -55,7 +58,7 @@ namespace abr {
       // The report comes from the network: it is only believed up to what the host put on the wire for
       // that frame, once per FEC block of the frame.
       const auto sent_it = sent_.find(status.index);
-      if (sent_it == sent_.end()) {
+      if (sent_it == sent_.end() || sent_it->second.padded) {
         return;
       }
       // GameStream carries the block in two bits: at most four per frame
@@ -751,6 +754,20 @@ namespace abr {
         jitter_has_prev_ = true;
         jitter_prev_index_ = r.index;
         jitter_prev_delay_us_ = first_delay;
+        if (e.padded) {
+          // A padded probe is read apart, tight or spread: past the router's burst bucket it shows the rate the pipe
+          // carries (a lower bound once the bucket is taken out), and it feeds neither the trains nor the plain proofs.
+          if (send_span > 0 && span > 0 && r.packets >= 2) {
+            const double n = r.packets;
+            const double bits = r.bytes * wire_ratio * 8.0;
+            const double proof = bits * (n - 1.0) / n / std::max(span, send_span);
+            if (proof > m.proof_pad_bps) {
+              m.proof_pad_bps = proof;
+              m.proof_pad_bits = bits;
+            }
+          }
+          continue;
+        }
         if (send_span > 0 && r.packets >= static_cast<uint32_t>(kTrainMinPackets)) {
           ++m.eligible;
           if (span > kMinDispersion * send_span) {

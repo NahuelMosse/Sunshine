@@ -303,6 +303,48 @@ TEST(AbrSignalsTest, FramesSpreadByTheBottleneckComeBackAsTrains) {
   }
 }
 
+TEST(AbrSignalsTest, APaddedProbeIsReadApartFromTheTrainsAndTheLossStatistics) {
+  meter_sim_t sim;
+  sim.run(2);
+  SentFrame c;
+  c.index = ++sim.index;
+  c.t_first_us = sim.now;
+  c.t_last_us = sim.now + 24000;
+  c.data_packets = 10;
+  c.packets = 60;
+  c.rtp_bytes = 60000;
+  c.wire_bytes = 66000;
+  c.padded = true;
+  sim.meter.sent(c);
+  const double span = c.wire_bytes * 8.0 / sim.capacity;
+  ReceivedTrain r;
+  r.index = c.index;
+  r.t_first_us = static_cast<uint32_t>(c.t_first_us + static_cast<int64_t>(sim.base_owd * 1e6) + sim.offset);
+  r.t_last_us = static_cast<uint32_t>(r.t_first_us + static_cast<int64_t>(span * 1e6));
+  r.bytes = 60000;
+  r.packets = 60;
+  sim.meter.train(r);
+  FecStatus f;
+  f.index = c.index;
+  f.data_total = 10;
+  f.parity_total = 50;
+  f.data_received = 10;
+  f.parity_received = 0;
+  f.missing = 0;
+  sim.meter.fec_status(f);
+  sim.next_measure = sim.now;
+  sim.next_summary = sim.next_ping = sim.next_rtt = sim.now + 1'000'000;
+  sim.tick();
+  ASSERT_TRUE(sim.measured);
+  EXPECT_GT(sim.m.proof_pad_bps, 0.0);
+  EXPECT_NEAR(sim.m.proof_pad_bits, 60000 * 1.1 * 8.0, 1.0);
+  for (const auto &t : sim.m.trains) {
+    EXPECT_NEAR(t.bytes, 22000.0, 1.0);  // the sim's own frames only
+  }
+  EXPECT_EQ(sim.m.proof_bps, 0.0);
+  EXPECT_NEAR(sim.m.loss, 0.0, 1e-9);
+}
+
 TEST(AbrSignalsTest, ArrivalReportsWithoutASentFrameOrBytesAreSkipped) {
   meter_sim_t sim;
   sim.run(1);
