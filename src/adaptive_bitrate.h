@@ -27,6 +27,7 @@
 #include "abr/control.h"
 #include "abr/gamestream/signals.h"
 #include "stream_pacing.h"
+#include "stream_padding.h"
 
 /**
  * @brief Bit of `x-ml-general.featureFlags`: the client sends Frame Stats (0x0204) with per-frame
@@ -188,6 +189,9 @@ namespace adaptive_bitrate {
     double budget = 0;  ///< The whole budget in bits per second, 0 before the controller acts.
     double pacing = 0;  ///< Pacing rate in bits per second, 0 for the stream's default.
     bool probe_fast = false;  ///< Coming back from a measured drop with the queue empty: probe frames go out every `cal::kPaceProbeFastS`.
+    bool pace_probe = false;  ///< A round-based rise is under way: every frame is paced at the largest multiple.
+    bool probe_quiet = false;  ///< The path is quiet: a probe frame goes out every `cal::kProbeQuietS`.
+    bool pad_probe = false;  ///< The probe frames may be padded with extra parity.
     double pay_multiple = 1.1;  ///< Multiple of the budget a frame is paid at: 1.1, more at the application's ceiling.
     int open_kbps = 0;  ///< Encoder bitrate a new encoder opens at, 0 for an encoder that keeps the client's bitrate.
     std::shared_ptr<const abr::Params> block_params;  ///< Parameters of an ordinary block, with the last step's failure target.
@@ -277,7 +281,7 @@ namespace adaptive_bitrate {
      * @param rtp_bytes Bytes the client counts of its packets.
      * @param wire_bytes Bytes it costs on the wire, with IP, UDP and encryption.
      */
-    void frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes);
+    void frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes, bool padded = false);
 
     /**
      * @brief Record how long a frame spent in the host, from capture until its first packet left.
@@ -608,17 +612,63 @@ namespace adaptive_bitrate {
      * @return Bits per second, or 0 for the stream's default pacing.
      */
     double frame_pacing_bps(std::chrono::steady_clock::time_point now) {
+      return frame_probe(now).pacing_bps;
+    }
+
+    /**
+     * @brief What the frame leaving now is: its pacing rate, and whether it is a probe frame to pad with extra parity.
+     */
+    struct frame_probe_t {
+      double pacing_bps = 0;  ///< Bits per second, or 0 for the stream's default pacing.
+      bool pad = false;  ///< The frame is a probe the controller wants padded with extra parity (`padded()` reports it).
+    };
+
+    /**
+     * @brief The pacing and the padding of the frame leaving now. Called from the session's video sender only.
+     *
+     * The pacing is the one of `frame_pacing_bps()`, except that while the path is quiet (`probe_quiet`) a probe frame
+     * leaves every `cal::kProbeQuietS` at most, and while a round-based rise is under way (`pace_probe`) every frame is
+     * paced at `abr::tun::kPaceMax`. A probe frame the decision allows to pad (`pad_probe`) is a quiet-path probe, or any
+     * frame of a rise at least `cal::kProbePadGapS` after the last padded one, and only if the padded probes stay
+     * under `cal::kProbePadDuty` of the budget on average.
+     *
+     * @param now When the frame leaves.
+     * @return The frame's pacing and whether to pad it.
+     */
+    frame_probe_t frame_probe(std::chrono::steady_clock::time_point now) {
       const auto decision = published.load();
       const double rate = mode == mode_e::full ? decision->pacing : 0.0;
       const double whole = decision->budget;
       if (rate <= 0 || whole <= 0) {
-        return rate;
+        return {rate, false};
       }
       double probe_s = abr::cal::kPaceProbeS;
       if (decision->probe_fast) {
         probe_s = probe_s > 0 ? std::min(probe_s, abr::cal::kPaceProbeFastS) : abr::cal::kPaceProbeFastS;
       }
-      return pace_probe.frame_multiplier(now, probe_s, rate / whole) * whole;
+      if (decision->probe_quiet) {
+        probe_s = probe_s > 0 ? std::min(probe_s, abr::cal::kProbeQuietS) : abr::cal::kProbeQuietS;
+      }
+      double multiple = pace_probe.frame_multiplier(now, probe_s, rate / whole);
+      if (decision->pace_probe) {
+        multiple = std::max(multiple, abr::tun::kPaceMax);
+      }
+      frame_probe_t frame {multiple * whole, false};
+      const bool quiet_probe = pace_probe.probed && decision->probe_quiet;
+      if (decision->pad_probe && (quiet_probe || decision->pace_probe)) {
+        const double now_s = std::chrono::duration<double>(now.time_since_epoch()).count();
+        frame.pad = pad_gate.due(now_s, whole, quiet_probe ? 0.0 : abr::cal::kProbePadGapS, abr::cal::kProbePadDuty);
+      }
+      return frame;
+    }
+
+    /**
+     * @brief Record that the frame `frame_probe()` asked to pad went out with extra parity. Called from the session's video sender only.
+     * @param now When the frame left.
+     * @param extra_bits Wire bits of the extra parity.
+     */
+    void padded(std::chrono::steady_clock::time_point now, double extra_bits) {
+      pad_gate.sent(std::chrono::duration<double>(now.time_since_epoch()).count(), extra_bits);
     }
 
     /**
@@ -777,6 +827,7 @@ namespace adaptive_bitrate {
 
     // Used by the video sender only.
     stream::pace_probe_t pace_probe;
+    stream::padding::gate_t pad_gate;
 
     /// The parameters of a block that repairs a loss: stricter failure target, more parity allowed.
     static std::shared_ptr<const abr::Params> repair_params_of(const abr::Params &base);

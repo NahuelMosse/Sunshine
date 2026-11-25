@@ -40,6 +40,9 @@ TEST(AbrPacingTest, OneProbeFramePerSecondAtTwice) {
     }
   }
   EXPECT_EQ(probes, 3);
+  EXPECT_FALSE(probe.probed) << "the last frame of the run was not a probe";
+  EXPECT_DOUBLE_EQ(probe.frame_multiplier(start + 10s, 1.0, 1.3), 2.0);
+  EXPECT_TRUE(probe.probed) << "a probe frame says so";
 
   stream::pace_probe_t never;
   EXPECT_DOUBLE_EQ(never.frame_multiplier(start, 0.0, 1.3), 1.3);

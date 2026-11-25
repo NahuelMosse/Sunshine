@@ -103,6 +103,7 @@ namespace stream {
      * @return 2 for a probe frame, else `multiple`.
      */
     double frame_multiplier(std::chrono::steady_clock::time_point now, double probe_s, double multiple) {
+      probed = false;
       if (probe_s <= 0) {
         return multiple;
       }
@@ -110,12 +111,14 @@ namespace stream {
         return multiple;
       }
       started = true;
+      probed = true;
       last = now;
       return 2.0;
     }
 
     std::chrono::steady_clock::time_point last {};  ///< When the last probe frame left.
     bool started = false;  ///< Whether a frame left already.
+    bool probed = false;  ///< Whether the last frame was a probe frame.
   };
 
 }  // namespace stream

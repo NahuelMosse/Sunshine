@@ -217,7 +217,7 @@ namespace adaptive_bitrate {
     BOOST_LOG(info) << "Adaptive bitrate: the client announced its signals, the controller acts from the start"sv;
   }
 
-  void session_t::frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes) {
+  void session_t::frame_sent(std::uint32_t frame_index, std::chrono::steady_clock::time_point first, std::chrono::steady_clock::time_point last, int packets, int data_packets, double rtp_bytes, double wire_bytes, bool padded) {
     abr::gamestream::SentFrame frame;
     frame.index = frame_index;
     frame.t_first_us = to_us(first);
@@ -226,6 +226,7 @@ namespace adaptive_bitrate {
     frame.data_packets = data_packets;
     frame.rtp_bytes = rtp_bytes;
     frame.wire_bytes = wire_bytes;
+    frame.padded = padded;
 
     std::lock_guard lg {lock};
     meter.sent(frame);
@@ -585,6 +586,9 @@ namespace adaptive_bitrate {
     draft.burst = decision.loss_burst;
     draft.min_parity = decision.min_parity;
     draft.probe_fast = decision.probe_fast;
+    draft.pace_probe = decision.pace_probe;
+    draft.probe_quiet = decision.probe_quiet;
+    draft.pad_probe = decision.pad_probe;
     publish();
 
     // One line per controller step, in a fixed key=value layout so a session can be analysed
