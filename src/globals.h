@@ -60,6 +60,7 @@ namespace mail {
   MAIL(ltr_ack);  ///< Long-term reference frame the client acknowledged (0x0350).
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
+  MAIL(frame_divider);  ///< Captured frames to encode in every thousand: 1000 encodes all of them, 500 every other one.
 #undef MAIL
 
 }  // namespace mail
