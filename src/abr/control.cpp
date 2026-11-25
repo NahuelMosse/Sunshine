@@ -775,6 +775,11 @@ namespace abr {
     t_bandwidth_ = 0;
     pipe_before_cut_ = pipe_after_cut_ = 0;
     t_way_back_lift_ = -1e9;
+    t_round_ = t_round_refuted_ = t_restore_until_ = t_proof_round_ = t_chain_start_ = t_fifo_ = -1e9;
+    round_base_ = 0;
+    chain_proof_rounds_ = 0;
+    chain_fifo_ = false;
+    proof_refuted_ = false;
     return_refuted_ = false;
     t_fast_backoff_ = -1e9;
     shortfall_streak_ = 0;
@@ -833,6 +838,7 @@ namespace abr {
 
     // ── 4. the ceilings, the parity and the encoder ───────────────────────────
     ceilings(m, c);
+    rounds(m, c);
     parity_budget(c);
     encoder_compensation(m, c);
     audit(m, c);
@@ -876,6 +882,9 @@ namespace abr {
         reexplore_wait_ = std::min(kReexploreMaxFactor * kReexploreS, 2.0 * (reexplore_wait_ > 0 ? reexplore_wait_ : kReexploreS));
       } else if (m.t - t_cut_ > kWayBackS) {
         reexplore_wait_ = 0;
+      }
+      if (m.t - t_proof_round_ < cal::kCutEpisodeS) {
+        proof_refuted_ = true;
       }
       t_cut_ = m.t;
     }
@@ -1645,9 +1654,13 @@ namespace abr {
       // budget may stand on the ceiling itself. Trimmed by the utilization it stayed at 0.875 of it after
       // every cut while before the cut it stood on it, a path-dependent level 4 s after the pipe came back.
       const bool clean = m.t - t_loss_ > tun::kEstimationWindow && m.t - t_last_queue_ > tun::kEstimationWindow;
-      double ceiling = clean && train_bandwidth_ >= p_.bitrate_max ? p_.bitrate_max : p_.train_utilization * train_bandwidth_;
+      // While a chain of rounds is open a measure clipped at the maximum does not lift the ceiling to the maximum: the rounds
+      // are verifying the rise.
+      const bool in_chain = m.t - t_round_ < kRoundsChainDeadTimes * (std::max(0.05, m.rtt) + 0.05);
+      const bool at_max = clean && !in_chain && train_bandwidth_ >= p_.bitrate_max;
+      double ceiling = at_max ? p_.bitrate_max : p_.train_utilization * train_bandwidth_;
       // The utilization margin covers the measure's error only up to its size: past that, the ceiling is its lower bound
-      if (train_lo_ > 0 && !(clean && train_bandwidth_ >= p_.bitrate_max)) {
+      if (train_lo_ > 0 && !at_max) {
         ceiling = std::min(ceiling, train_lo_);
       }
       if (R_ > ceiling) {
@@ -1690,6 +1703,128 @@ namespace abr {
       if (c.reason == Reason::ramping || c.reason == Reason::steady) {
         c.reason = Reason::capped;
       }
+    }
+  }
+
+  // The round-based rise. The law cannot rise by itself and the ramp feels its way; here the pipe is read from what the
+  // frame trains, the padded probes and the proofs show, and the budget goes there in rounds. A round is the dead time
+  // after the last step: only frames that arrived after it were sent at the budget the step set, so each round verifies
+  // the one before. Moving a share `gain` of the way leaves (1 - gain) of the error, whatever the delay is.
+  void Control::rounds(const Measurement &m, Cycle &c) {
+    const double dead = std::max(0.05, m.rtt) + 0.05;
+    c.d.pace_probe = m.t - t_round_ < kRoundsPaceProbeDeadTimes * dead && startup_done_;
+    // The probes of a chain are padded only while the budget is under the train bandwidth: past it padding shows nothing more.
+    const auto pad_room = [&] {
+      return train_bandwidth_ <= 0 || measured_drop(m.t) || R_ < kPadRoom * p_.train_utilization * train_bandwidth_;
+    };
+    // A round the queue or the loss refuted (they trip within a few rounds of it) switches the rise and its probes off
+    // for a while: the proofs that sent it past the pipe would do it again.
+    const bool gated = !startup_done_ || app_limited_ || unquiet_ || c.queue > c.dref || c.loss_evidence || c.reason == Reason::loss_backoff;
+    if (gated && (c.queue > c.dref || c.loss_evidence) && m.t - t_round_ < kRoundsChainDeadTimes * dead) {
+      t_round_refuted_ = m.t;
+      t_restore_until_ = m.t + kRoundsRestoreHoldS;
+    }
+    // The budget before the round was a proven operating point: while a refuted round settles, the cut that follows it does not
+    // go under a share of that point.
+    if (m.t < t_restore_until_ && round_base_ > 0 && R_ < kRoundsRestore * round_base_ && c.queue <= kRoundsRestoreQueue * c.dref && !c.loss_evidence && m.received_rate >= kRoundsRestoreRecv * round_base_) {
+      R_ = kRoundsRestore * round_base_;
+    }
+    // And for a while after a cut: the drop is settled by its own way back, and a rise that overlaps it would be a second cycle.
+    const bool refuted = m.t - t_round_refuted_ < kRoundsRefutedS || m.t - t_cut_ < kRoundsAfterCutS;
+    c.d.probe_quiet = startup_done_ && !app_limited_ && !unquiet_ && m.arrival_jitter < kJitterQuiet && !refuted && !measured_drop(m.t) &&
+                      m.t - t_loss_ > tun::kEstimationWindow && c.queue < 0.5 * c.dref && !c.loss_evidence && c.reason != Reason::loss_backoff;
+    bool trains_fresh = false;
+    for (const Train &x : trains_) {
+      trains_fresh = trains_fresh || m.t - x.t < kPadTrainFreshS;
+    }
+    c.d.pad_probe = (c.d.pace_probe && pad_room()) || (c.d.probe_quiet && !trains_fresh);
+    if (gated || refuted) {
+      return;
+    }
+    const double since = std::max({t_round_, t_cut_, t_fast_backoff_, t_alarm_}) + dead;
+    std::vector<double> q;
+    for (const Train &x : trains_) {
+      if (x.t < since) {
+        continue;
+      }
+      const double packets = x.bits / (8.0 * static_cast<double>(p_.mtu + p_.header_bytes));
+      q.push_back(x.bits * (1.0 - 1.0 / packets) / x.span);
+    }
+    // The trains give the pipe as their median. A probe frame paced at kPaceMax times the budget that crosses a pipe
+    // wider than its pace is not a train: it arrives as tight as it left and the meter reports it as a proof that the
+    // pipe carries at least its rate. The larger of the two readings counts, capped at what a probe can show.
+    std::sort(q.begin(), q.end());
+    double pipe = q.size() >= 3 ? q[q.size() / 2] : 0.0;
+    const bool trains_show = pipe > 0;
+    // A proof proves nothing where frames come out squeezed or a router lets bursts through: under jitter, after loss,
+    // and on the way back from a measured drop (where the proofs are bounded by the pipe from before the cut) it is not read.
+    const bool proof_ok = m.arrival_jitter < kJitterQuiet && !jittery(m) && m.t - t_loss_ > tun::kEstimationWindow && !measured_drop(m.t);
+    if (proof_refuted_ && m.t - t_cut_ >= kWayBackS) {
+      proof_refuted_ = false;
+    }
+    const bool chain_open = m.t - t_round_ < kRoundsChainDeadTimes * dead;
+    // A padded probe that crossed tight outran the burst bucket: what it proves is the rate over what the bucket could have
+    // carried by itself.
+    const double proof_pad = m.proof_pad_bits > 0 ? m.proof_pad_bps * std::max(0.0, 1.0 - 8.0 * kProbePadBucket / m.proof_pad_bits) : 0.0;
+    // A FIFO pipe spreads every frame big enough to measure; a burst bucket lets some cross tight. Clean reports whose frames
+    // all came out spread say the pipe is FIFO, and a chain that begins within a few seconds of that reads plain proofs too.
+    int fifo_eligible = 0, fifo_spread = 0;
+    for (const SpreadCount &x : spread_counts_) {
+      fifo_eligible += x.eligible;
+      fifo_spread += x.spread;
+    }
+    const bool fifo_clean = c.queue < 0.5 * c.dref && !c.loss_evidence && m.t - t_cut_ > tun::kEstimationWindow && m.t - t_loss_ > tun::kEstimationWindow && m.arrival_jitter < kJitterQuiet;
+    if (fifo_clean && fifo_eligible >= kFifoMinFrames && fifo_spread >= kFifoShare * fifo_eligible) {
+      t_fifo_ = m.t;
+    }
+    const bool fifo_now = m.t - t_fifo_ <= kFifoMemoryS;
+    const bool fifo = chain_open ? chain_fifo_ : fifo_now;
+    const bool chain_confirmed = ((chain_open && chain_proof_rounds_ >= 1 && t_proof_round_ >= t_chain_start_) || fifo) && c.queue <= kRoundsChainPlain * c.dref;
+    const double proof_read = chain_confirmed ? std::max(proof_pad, m.proof_back_bps) : proof_pad;
+    if (proof_ok && !proof_refuted_ && m.t >= since && proof_read > 0) {
+      pipe = std::max(pipe, pipe <= 0 ? std::min(proof_read, kRoundsProofCap * R_) : proof_read);
+    }
+    if (pipe <= 0) {
+      return;
+    }
+    pipe = std::min(pipe, tun::kPaceMax * R_);
+    const double target = std::min(p_.bitrate_max, p_.train_utilization * pipe);
+    if (target <= R_ * (1.0 + kRoundsMinStep)) {
+      return;
+    }
+    const bool chain_first = m.t - t_round_ >= kRoundsChainDeadTimes * dead;
+    if (chain_first) {
+      round_base_ = R_;
+      chain_fifo_ = fifo_now;
+      chain_proof_rounds_ = 0;
+      t_chain_start_ = m.t;
+    }
+    // A round whose only proof is a padded probe is a lower bound: it steps straight to its target, and it does not refresh
+    // the dispersion bandwidth's age.
+    const bool pad_only = !trains_show;
+    double gain = kRoundsGain;
+    if (chain_fifo_) {
+      gain = chain_first ? 1.0 : kFifoGain;
+    }
+    const double next = pad_only ? target : R_ + gain * (target - R_);
+    R_ = std::min(p_.bitrate_max, next);
+    anchor_ = std::max(anchor_, R_);
+    if (pipe > train_bandwidth_ && !pad_only) {
+      train_bandwidth_ = pipe;
+      train_lo_ = 0;
+      t_bandwidth_ = m.t;
+    }
+    if (pad_only) {
+      t_proof_round_ = m.t;
+      ++chain_proof_rounds_;
+    } else {
+      chain_proof_rounds_ = 0;
+    }
+    t_round_ = m.t;
+    c.d.pace_probe = true;
+    c.d.pad_probe = c.d.pad_probe || pad_room();
+    if (c.reason == Reason::steady || c.reason == Reason::ramping || c.reason == Reason::capped) {
+      c.reason = Reason::ramping;
     }
   }
 

@@ -78,6 +78,12 @@ namespace abr {
     /// The same with frames of at least kQuietFrameMinPacketsBack packets, for the way back from a cut.
     double proof_back_bps = 0;
     /**
+     * @brief The best crossing of a padded probe frame, in bits/s on the wire over its send span, and the wire bits
+     *   of that frame; 0 if none arrived. A padded frame is read apart from the trains and the plain proofs.
+     */
+    double proof_pad_bps = 0;
+    double proof_pad_bits = 0;
+    /**
      * @brief What the encoder delivered, in bits/s of picture data —without parity or network
      *   headers—. Zero if unknown.
      */
@@ -158,6 +164,9 @@ namespace abr {
     int samples = 0;  ///< how much evidence the decision rested on
     bool reanchored = false;  ///< the ramp-up curve was moved to a new anchor in this step
     bool capped = false;  ///< the budget ran into the bitrate bounds or the proven ceiling
+    bool pace_probe = false;  ///< a round-based rise is under way: every frame goes out at the largest pacing multiple
+    bool probe_quiet = false;  ///< the queue is clear and the path quiet: a probe frame every cal::kProbeQuietS, so the trains see above the budget
+    bool pad_probe = false;  ///< probe frames may be padded with extra parity: a rise is under way, or the path is quiet and no train showed the pipe lately
     bool probe_fast = false;  ///< on the way back from a measured drop, with the queue empty: a probe frame every kPaceProbeFastS
   };
 
@@ -582,6 +591,18 @@ namespace abr {
     // The frames at the current budget have enough packets for their dispersion to stand for the pipe.
     bool frames_measurable() const;
     bool measured_drop(double t) const;
+    // The round-based rise, run after the ceilings.
+    void rounds(const Measurement &m, Cycle &c);
+    double t_round_ = -1e9;  // when the last round moved the budget
+    double t_round_refuted_ = -1e9;  // when the queue or loss last refuted a round
+    double round_base_ = 0;  // the budget before the first round of the chain that is under way
+    double t_restore_until_ = -1e9;  // a refuted round holds the budget at its base until then
+    int chain_proof_rounds_ = 0;  // rounds of the chain under way that rested on a proof alone
+    double t_proof_round_ = -1e9;  // when the last round rested on a proof alone (no train showed the pipe)
+    double t_chain_start_ = -1e9;  // when the chain under way began
+    double t_fifo_ = -1e9;  // last clean report window whose frames came out spread
+    bool chain_fifo_ = false;  // the chain under way began on a FIFO pipe
+    bool proof_refuted_ = false;  // a cut followed a proof-only round: proofs are not read until the way back ends
     double floor_settle_until_ = 0;  // until then the delay floor follows the current delay (kPathSettleS)
   };
 

@@ -497,6 +497,35 @@ namespace abr {
     constexpr double kCutEpisodeS = 5.0;  ///< seconds within which a cut that follows another is the same episode
     constexpr double kEarlyShare = 0.82;  ///< an early re-exploration climbs to this share of the pipe measured after the cut: inside the settled band, under the utilization point
     constexpr double kEarlyDepth = 0.45;  ///< the pipe measured after the cut must be under this share of the pipe before it for an early re-exploration
+
+    // The round-based rise: once per round (the dead time after the last step) the budget moves part of the way to the
+    // utilization times the pipe the frame trains, the padded probes or the proofs show; the next round waits for frames
+    // sent at the new budget to be reported, so the loop's delay cannot make it ring.
+    constexpr double kRoundsGain = 0.6;  ///< share of the way to the target a round moves the budget
+    constexpr double kRoundsMinStep = 0.03;  ///< a round moves the budget only if the target is this much above it
+    constexpr double kRoundsChainDeadTimes = 8.0;  ///< dead times after a round within which the chain of rounds stays open
+    constexpr double kRoundsPaceProbeDeadTimes = 4.0;  ///< dead times after a round during which every frame goes out at kPaceMax times the budget
+    constexpr double kRoundsProofCap = 1.75;  ///< a reading that rests on a proof alone does not go past this multiple of the budget
+    constexpr double kRoundsAfterCutS = 3 * tun::kEstimationWindow;  ///< the rounds and their probes stay off for this long after a cut of the budget
+    constexpr double kRoundsRefutedS = tun::kMemory;  ///< a round that the queue or loss refuted stays off, with its probes, for this long
+    constexpr double kRoundsRestore = 1.0;  ///< a refuted round does not let the cut go under this share of the budget before it...
+    constexpr double kRoundsRestoreHoldS = 2.0;  ///< ...for this long...
+    constexpr double kRoundsRestoreQueue = 4.0;  ///< ...while the queue stays under this multiple of its reference...
+    constexpr double kRoundsRestoreRecv = 0.9;  ///< ...and the client still receives this share of that budget
+    constexpr double kRoundsChainPlain = 0.5;  ///< plain proofs count in a chain latched as FIFO or opened by a padded proof while the believed queue is under this share of dref
+    constexpr int kFifoMinFrames = 24;  ///< fewest clean-report frames big enough to measure for the FIFO tell
+    constexpr double kFifoShare = 1.0;  ///< share of those that must come out spread
+    constexpr double kFifoMemoryS = 3.0;  ///< how long the FIFO tell lasts
+    constexpr double kFifoGain = 0.8;  ///< gain of the rounds of a chain latched as FIFO; the first round of it takes the whole way (1)
+    constexpr double kProbeQuietS = 1.0;  ///< with the queue clear and the path quiet, a probe frame goes out every so many seconds
+    constexpr double kPadTrainFreshS = 1.0;  ///< a train within this many seconds means the pipe shows by itself: a quiet probe is not padded
+    constexpr double kPadRoom = 0.95;  ///< the probes of a chain are padded only while the budget is under this share of the utilization-trimmed train bandwidth (not on the way back from a measured drop)
+    // The padded probe: extra parity at the probe's pace, so a frame that still crosses tight has outrun the burst bucket of a router.
+    constexpr double kProbePadBucket = 15000;  ///< the burst bucket a padded probe has to outrun, in bytes on the wire
+    constexpr double kProbePadK = 4.0;  ///< a padded probe is padded up to this many buckets
+    constexpr double kProbePadMinK = 2.6;  ///< and goes out unpadded unless it can reach this many buckets with the parity it may carry
+    constexpr double kProbePadGapS = 0.1;  ///< least time between padded probes of a chain
+    constexpr double kProbePadDuty = 0.2;  ///< the padded probes add at most this share of the budget on average
   }  // namespace cal
 
   /**
