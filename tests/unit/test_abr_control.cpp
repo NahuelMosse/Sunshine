@@ -484,3 +484,45 @@ TEST(AbrControlTest, ANarrowerPipeCutsOnlyAfterItsCycles) {
     EXPECT_EQ(first_cut, cycles - 1) << "kNarrowerCycles " << cycles;
   }
 }
+
+TEST(AbrControlTest, ARoundTakesTheBudgetStraightToWhatAPaddedProbeProves) {
+  auto p = params_for();
+  run_t r(p);
+  r.link.capacity = 6e6;
+  r.run(20);
+  const double before = r.last.budget;
+  ASSERT_LT(before, 6e6);
+  // The pipe widens. Every padded probe crosses tight at the probe's pace, twice the budget, as far as the pipe carries it,
+  // with 480 kbit on the wire
+  r.link.capacity = 16e6;
+  r.mutate = [&](abr::Measurement &m) {
+    m.proof_pad_bps = std::min(abr::tun::kPaceMax * r.last.budget, r.link.capacity);
+    m.proof_pad_bits = 480000;
+  };
+  r.max_budget = 0;
+  bool padding = false;
+  for (int i = 0; i < static_cast<int>(3.0 / p.Tc); ++i) {
+    r.run(p.Tc);
+    padding = padding || r.last.pad_probe;
+  }
+  // the padded frame is 60 kB against a 15 kB bucket: 1.5 times the pace is what it proves
+  EXPECT_GT(r.max_budget, 1.5 * before) << "without the proof the ramp alone reaches 1.2 times";
+  EXPECT_LE(r.max_budget, 16e6);
+  EXPECT_TRUE(padding) << "a rise under way asks for padded probes";
+}
+
+TEST(AbrControlTest, APaddedProbeSmallerThanTheBucketProvesNothing) {
+  auto p = params_for();
+  run_t r(p);
+  r.link.capacity = 6e6;
+  r.run(20);
+  const double before = r.last.budget;
+  r.link.capacity = 16e6;
+  r.mutate = [&](abr::Measurement &m) {
+    m.proof_pad_bps = abr::tun::kPaceMax * r.last.budget;
+    m.proof_pad_bits = 8.0 * abr::cal::kProbePadBucket;
+  };
+  r.max_budget = 0;
+  r.run(3);
+  EXPECT_LT(r.max_budget, 1.3 * before);
+}
