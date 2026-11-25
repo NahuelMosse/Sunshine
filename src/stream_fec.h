@@ -114,19 +114,27 @@ namespace stream::fec {
    * @brief Split a frame in the FEC blocks it needs.
    *
    * Each block holds at most max_data_shards() packets. A frame that needs more than MAX_FEC_BLOCKS
-   * blocks goes in MAX_FEC_BLOCKS blocks without parity.
+   * blocks goes in MAX_FEC_BLOCKS blocks without parity, or with `keep_parity` with the percentage
+   * lowered to what fits next to the data of its largest block, and no parity only when the data
+   * alone fills it.
    *
    * @param payload_bytes Size of the frame's payload.
    * @param blocksize Bytes in each packet.
    * @param percentage The requested parity percentage.
+   * @param keep_parity Whether a frame over MAX_FEC_BLOCKS blocks keeps the parity that fits.
    * @return The blocks and the percentage they carry.
    */
-  inline block_plan_t plan_blocks(std::size_t payload_bytes, std::size_t blocksize, int percentage) {
+  inline block_plan_t plan_blocks(std::size_t payload_bytes, std::size_t blocksize, int percentage, bool keep_parity = false) {
     const auto max_data_bytes = static_cast<std::size_t>(std::max(max_data_shards(percentage), 1)) * blocksize;
     const auto blocks_needed = (payload_bytes + max_data_bytes - 1) / max_data_bytes;
-    if (blocks_needed > MAX_FEC_BLOCKS) {
+    if (blocks_needed <= MAX_FEC_BLOCKS) {
+      return {blocks_needed, blocks_needed, percentage};
+    }
+    if (!keep_parity) {
       return {blocks_needed, MAX_FEC_BLOCKS, 0};
     }
-    return {blocks_needed, blocks_needed, percentage};
+    const std::size_t largest_block_data = (payload_bytes / MAX_FEC_BLOCKS + blocksize - 1) / blocksize;
+    const int fits = largest_block_data >= RS8_DATA_SHARDS_MAX ? 0 : static_cast<int>((RS8_DATA_SHARDS_MAX - largest_block_data) * 100 / largest_block_data);
+    return {blocks_needed, MAX_FEC_BLOCKS, std::min(percentage, fits)};
   }
 }  // namespace stream::fec

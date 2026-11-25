@@ -61,6 +61,7 @@ namespace mail {
   MAIL(gamepad_feedback);  ///< Gamepad feedback.
   MAIL(hdr);  ///< HDR.
   MAIL(frame_divider);  ///< Captured frames to encode in every thousand: 1000 encodes all of them, 500 every other one.
+  MAIL(repair_reach);  ///< How many frames back the encoder can still repair a loss from, without an IDR frame.
 #undef MAIL
 
 }  // namespace mail

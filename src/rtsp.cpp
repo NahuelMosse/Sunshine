@@ -23,6 +23,7 @@ extern "C" {
 #include <boost/bind.hpp>
 
 // local includes
+#include "adaptive_bitrate.h"
 #include "config.h"
 #include "globals.h"
 #include "input.h"
@@ -31,6 +32,7 @@ extern "C" {
 #include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
+#include "stream_pacing.h"
 #include "sync.h"
 #include "video.h"
 
@@ -894,7 +896,7 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    ss << "a=x-ss-general.featureFlags:" << (uint32_t) (platf::get_capabilities() | adaptive_bitrate::host_feature_flags(adaptive_bitrate::mode_from_string(config::stream.adaptive_bitrate))) << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;
@@ -1103,6 +1105,7 @@ namespace rtsp_stream {
     args.try_emplace("x-nv-video[0].clientRefreshRateX100"sv, "0"sv);
 
     stream::config_t config;
+    config.ipHeaderBytes = stream::ip_udp_header_bytes(sock.remote_endpoint().address());
 
     std::int64_t configuredBitrateKbps;
     config.audio.flags[audio::config_t::HOST_AUDIO] = session.host_audio;
@@ -1172,6 +1175,9 @@ namespace rtsp_stream {
       config.monitor.enableIntraRefresh = (int) util::from_view(args.at("x-ss-video[0].intraRefresh"sv));
 
       configuredBitrateKbps = util::from_view(args.at("x-ml-video.configuredBitrateKbps"sv));
+      // The controller's ceiling: the bitrate the user set, before it is reduced below for parity,
+      // audio and overhead
+      config.requestedBitrateKbps = adaptive_bitrate::ceiling_kbps(config.monitor.bitrate, configuredBitrateKbps);
     } catch (std::out_of_range &) {
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
