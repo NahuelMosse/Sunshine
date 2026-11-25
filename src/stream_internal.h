@@ -104,8 +104,9 @@ namespace stream {
    * @param rtp_bytes RTP bytes sent.
    * @param wire_bytes Bytes on the wire, headers included.
    * @param pay_multiple The multiple of the budget the frame is paid at, from the decision it was sent with.
+   * @param padded Whether the frame is a probe padded with extra parity.
    */
-  void report_frame(session_t &session, video::packet_raw_t &packet, std::chrono::steady_clock::time_point frame_start, double budget_bps, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes, double pay_multiple);
+  void report_frame(session_t &session, video::packet_raw_t &packet, std::chrono::steady_clock::time_point frame_start, double budget_bps, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes, double pay_multiple, bool padded = false);
 
   /**
    * @brief Bytes each video packet costs on the wire beyond what the client counts.

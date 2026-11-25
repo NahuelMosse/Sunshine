@@ -5,6 +5,7 @@
 
 // standard includes
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <future>
@@ -12,6 +13,7 @@
 #include <optional>
 #include <queue>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -35,6 +37,7 @@
 #include "stream_fec.h"
 #include "stream_internal.h"
 #include "stream_pacing.h"
+#include "stream_padding.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -1885,8 +1888,9 @@ namespace stream {
    * @param rtp_bytes RTP bytes sent.
    * @param wire_bytes Bytes on the wire, headers included.
    * @param pay_multiple The multiple of the budget the frame is paid at, from the decision it was sent with.
+   * @param padded Whether the frame is a probe padded with extra parity.
    */
-  void report_frame(session_t &session, video::packet_raw_t &packet, std::chrono::steady_clock::time_point frame_start, double budget_bps, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes, double pay_multiple) {
+  void report_frame(session_t &session, video::packet_raw_t &packet, std::chrono::steady_clock::time_point frame_start, double budget_bps, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes, double pay_multiple, bool padded) {
     if (budget_bps > 0) {
       session.video.paid_until = stream::paid_until(frame_start, wire_bytes, budget_bps, pay_multiple);
     }
@@ -1894,7 +1898,7 @@ namespace stream {
       if (packet.frame_timestamp) {
         session.adaptive->host_delay(*first_send - *packet.frame_timestamp);
       }
-      session.adaptive->frame_sent((uint32_t) packet.frame_index(), *first_send, last_send, packets, data_packets, rtp_bytes, wire_bytes);
+      session.adaptive->frame_sent((uint32_t) packet.frame_index(), *first_send, last_send, packets, data_packets, rtp_bytes, wire_bytes, padded);
     }
   }
 
@@ -2065,7 +2069,31 @@ namespace stream {
 
       try {
         // Use around 80% of 1Gbps, or the adaptive controller's pacing when it is lower
-        const auto ratecontrol = pacing(blocksize, controller_pacing_bps(*session, holds, std::chrono::steady_clock::now()));
+        const auto frame_now = std::chrono::steady_clock::now();
+        const auto probe = holds ? session->adaptive->frame_probe(frame_now) : adaptive_bitrate::session_t::frame_probe_t {};
+        const auto ratecontrol = pacing(blocksize, probe.pacing_bps);
+
+        // A probe the controller wants padded carries extra parity: only the blocks' percentage grows, so the frame's data
+        // shards and the protocol are unchanged, and a frame that cannot reach the size the probe needs goes out as it is.
+        // A frame that repairs a loss or opens a stream is never padded.
+        stream::padding::plan_t pad_plan;
+        if (probe.pad && fecPercentage > 0 && !packet->is_idr() && !packet->after_ref_frame_invalidation) {
+          std::vector<std::size_t> block_shards;
+          int base_percentage = fecPercentage;
+          for (auto it = fec_blocks_begin; it != fec_blocks_end; ++it) {
+            block_shards.push_back((it->size() + (blocksize - 1)) / blocksize);
+            base_percentage = std::max(base_percentage, session->adaptive->block_fec_percentage((int) block_shards.back(), false, *decision));
+          }
+          const double wire_packet_bytes = (double) (blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0) + session->config.ipHeaderBytes);
+          const auto packets_for = [&](double buckets) {
+            return (std::size_t) std::ceil(buckets * abr::cal::kProbePadBucket / wire_packet_bytes);
+          };
+          const auto pad_min_parity = session->adaptive->min_parity(session->config.minRequiredFecPackets, *decision);
+          pad_plan = stream::padding::plan(block_shards, (std::size_t) base_percentage, (std::size_t) std::max(0, pad_min_parity), packets_for(abr::cal::kProbePadK), packets_for(abr::cal::kProbePadMinK));
+          if (pad_plan.padded) {
+            session->adaptive->padded(frame_now, (double) pad_plan.extra_parity * wire_packet_bytes * 8.0);
+          }
+        }
         const size_t ratecontrol_packets_in_1ms = ratecontrol.packets_in_1ms;
 
         // Send less than 64K in a single batch.
@@ -2131,6 +2159,9 @@ namespace stream {
             if (pct >= 0) {
               block_fec_percentage = pct;
             }
+          }
+          if (pad_plan.padded) {
+            block_fec_percentage = std::max((int) block_fec_percentage, (int) pad_plan.percentages[blockIndex]);
           }
 
           frame_fec_latency_logger.first_point_now();
@@ -2280,7 +2311,7 @@ namespace stream {
 
         session->video.lowseq = lowseq;
 
-        report_frame(*session, *packet, ratecontrol_frame_start, budget_bps, frame_first_send, frame_last_send, frame_packets, frame_data_packets, frame_rtp_bytes, frame_wire_bytes, decision ? decision->pay_multiple : 1.1);
+        report_frame(*session, *packet, ratecontrol_frame_start, budget_bps, frame_first_send, frame_last_send, frame_packets, frame_data_packets, frame_rtp_bytes, frame_wire_bytes, decision ? decision->pay_multiple : 1.1, pad_plan.padded);
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
