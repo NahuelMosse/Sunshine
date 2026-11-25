@@ -14,6 +14,7 @@
 // local includes
 #include "frame_divider.h"
 #include "platform/common.h"
+#include "sync.h"
 #include "video.h"
 
 namespace video {
@@ -55,5 +56,10 @@ namespace video {
    * @param divider The share of captured images to encode.
    */
   void encode_run(int &frame_nr, safe::mail_t mail, img_event_t images, config_t config, std::shared_ptr<platf::display_t> disp, std::unique_ptr<platf::encode_device_t> encode_device, safe::signal_t &reinit_event, const encoder_t &encoder, stream::session_t *channel_data, frame_divider_t &divider);
+
+  /**
+   * @brief Apply the bitrate the adaptive bitrate controller asked for, and say once when the encoder cannot change it.
+   */
+  void apply_requested_bitrate(encode_session_t &session, safe::mail_raw_t::event_t<int> &events, safe::mail_raw_t::event_t<int> &fixed_events, bool &fixed_reported);
 
 }  // namespace video

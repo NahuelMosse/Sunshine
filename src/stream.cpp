@@ -5,12 +5,15 @@
 
 // standard includes
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -34,6 +37,7 @@
 #include "stream_fec.h"
 #include "stream_internal.h"
 #include "stream_pacing.h"
+#include "stream_padding.h"
 #include "sync.h"
 #include "system_tray.h"
 #include "thread_safe.h"
@@ -513,6 +517,7 @@ namespace stream {
     asio::io_context io_context;  ///< Asio context used by the UDP broadcast sockets.
 
     udp::socket video_sock {io_context};  ///< UDP socket bound for video packet transmission.
+    std::chrono::steady_clock::time_point video_epoch;  ///< Origin of the RTP timestamps of every video sender.
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
@@ -541,6 +546,9 @@ namespace stream {
       std::string ping_payload;  ///< Payload expected from video-channel ping packets.
 
       int lowseq;  ///< Next base sequence number for video RTP packets.
+      // When this session's frames sent so far are paid for at its adaptive budget. Per session:
+      // the broadcast thread serves every session, and one session's budget must not hold another's frames.
+      std::chrono::steady_clock::time_point paid_until;  ///< When this session's frames sent so far are paid for at its budget.
       udp::endpoint peer;  ///< Client UDP endpoint for the video channel.
 
       std::optional<crypto::cipher::gcm_t> cipher;  ///< Optional AES-GCM cipher for encrypted video packets.
@@ -549,10 +557,21 @@ namespace stream {
       safe::mail_raw_t::event_t<bool> idr_events;  ///< Event requesting an instantaneous decoder refresh frame.
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;  ///< Event carrying the reference-frame range to invalidate.
       safe::mail_raw_t::event_t<std::uint32_t> ltr_ack_events;  ///< Event carrying the long-term reference frame the client acknowledged.
+      safe::mail_raw_t::event_t<int> bitrate_events;  ///< Event carrying a new target bitrate in kbps.
+      safe::mail_raw_t::event_t<int> bitrate_fixed_events;  ///< Event saying the encoder keeps its bitrate, in kbps.
       safe::mail_raw_t::event_t<int> repair_reach_events;  ///< Event saying how many frames back the encoder repairs a loss from.
       safe::mail_raw_t::event_t<int> frame_divider_events;  ///< Event carrying the share of captured frames to encode, in thousandths.
 
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for video-socket QoS configuration.
+
+      // With the adaptive controller pacing the session, its packets leave from a sender thread of
+      // its own: paced on the shared thread, every session would wait on the others' pacing. It
+      // starts with the session's first frame (adaptive_bitrate::session_t::own_sender).
+      std::mutex sender_lock;  ///< Guards the start of the session's own sender against the end of the session.
+      bool sender_closed = false;  ///< The session is ending: no sender of its own starts any more.
+      bool sender_failed = false;  ///< The timer of the session's own sender could not be created: the broadcast sender keeps the session's video, without the controller's hold.
+      std::shared_ptr<safe::queue_t<video::packet_t>> packets;  ///< Queue the session's own sender thread takes packets from.
+      std::jthread sender;  ///< Sender thread of the session, when its video is paced by the controller.
     } video;  ///< Video worker thread state for the active stream.
 
     struct {
@@ -1455,9 +1474,16 @@ namespace stream {
               wait = std::min(wait, adaptive_bitrate::control_wait(session->adaptive.get()));
             }
             if (session->adaptive && session->control.peer) {
+              if (session->video.bitrate_fixed_events->peek()) {
+                if (auto kbps = session->video.bitrate_fixed_events->pop(0ms)) {
+                  session->adaptive->encoder_bitrate_fixed(*kbps);
+                }
+              }
               if (session->video.repair_reach_events->peek()) {
                 if (auto frames = session->video.repair_reach_events->pop(0ms)) {
                   session->adaptive->encoder_repair_reach(*frames);
+                  // Every new encoder says it, so the new one gets the controller's bitrate at once
+                  session->adaptive->encoder_reopened();
                 }
               }
               if (session->adaptive->enet_ping_due(now)) {
@@ -1467,6 +1493,9 @@ namespace stream {
                 session->video.frame_divider_events->raise(divider);
               }
               session->adaptive->tick(now, session->control.peer->roundTripTime / 1000.0);
+              if (auto kbps = session->adaptive->bitrate_to_apply(now)) {
+                session->video.bitrate_events->raise(kbps);
+              }
               if (session->adaptive->take_idr_request()) {
                 if (auto divider = session->adaptive->take_frame_divider()) {
                   session->video.frame_divider_events->raise(divider);
@@ -1684,11 +1713,17 @@ namespace stream {
 #endif
 
   /**
-   * @brief Run the broadcast video sender thread.
+   * @brief Run a video sender thread.
+   *
+   * The broadcast sender takes the packets of every session and sends them, except for the
+   * sessions with a sender of their own, whose packets it hands over to that sender's queue.
    *
    * @param sock Socket used to read or write the protocol message.
+   * @param video_epoch Origin of the RTP timestamps.
+   * @param own_packets Queue of the one session this thread sends for, or nullptr for the broadcast sender.
+   * @param timer Timer that paces the packets; the broadcast sender, given none, creates its own.
    */
-  void videoBroadcastThread(udp::socket &sock);
+  void videoSendThread(udp::socket &sock, std::chrono::steady_clock::time_point video_epoch, std::shared_ptr<safe::queue_t<video::packet_t>> own_packets, std::unique_ptr<platf::high_precision_timer> timer);
 
   /**
    * @brief What each video packet costs on the wire beyond the payload the client counts.
@@ -1703,28 +1738,172 @@ namespace stream {
   }
 
   /**
-   * @brief Report a sent frame to the adaptive bitrate controller.
+   * @brief The queue of the session's own sender, started on first use.
+   *
+   * @param session Session whose controller paces its video (adaptive_bitrate::session_t::own_sender).
+   * @param sock Socket the sender writes to.
+   * @param video_epoch Origin of the RTP timestamps.
+   * @param make_timer Creates the timer that paces the sender.
+   * @return The queue, or nullptr when the session has no sender of its own: its packets are sent by the broadcast sender.
+   */
+  std::shared_ptr<safe::queue_t<video::packet_t>> own_sender_queue(session_t &session, udp::socket &sock, std::chrono::steady_clock::time_point video_epoch, const std::function<std::unique_ptr<platf::high_precision_timer>()> &make_timer) {
+    std::lock_guard lg {session.video.sender_lock};
+    if (session.video.sender_failed) {
+      return nullptr;
+    }
+    // A session that had a sender of its own never goes back to the broadcast sender: after the
+    // close its queue is stopped and what is handed to it is dropped
+    if (session.video.sender_closed || session.video.packets) {
+      return session.video.packets;
+    }
+    auto timer = make_timer();
+    if (!timer || !*timer) {
+      BOOST_LOG(error) << "Failed to create the timer of the session's video sender; the broadcast sender keeps its video, at the stream's default pacing"sv;
+      session.video.sender_failed = true;
+      return nullptr;
+    }
+    // The session keeps the queue only once its thread runs: a queue nobody pops would swallow its video
+    auto packets = std::make_shared<safe::queue_t<video::packet_t>>(32);
+    session.video.sender = std::jthread {videoSendThread, std::ref(sock), video_epoch, packets, std::move(timer)};
+    session.video.packets = packets;
+    return packets;
+  }
+
+  /**
+   * @brief End the session's own sender: no sender starts after this, and the thread is joined.
+   *
+   * Frames still queued for the session are dropped. Called again, it does nothing.
+   *
+   * @param session The ending session.
+   */
+  void close_own_sender(session_t &session) {
+    std::shared_ptr<safe::queue_t<video::packet_t>> own_packets;
+    {
+      std::lock_guard lg {session.video.sender_lock};
+      session.video.sender_closed = true;
+      own_packets = session.video.packets;
+    }
+    if (own_packets) {
+      own_packets->stop();
+      if (session.video.sender.joinable()) {
+        session.video.sender.join();
+      }
+    }
+  }
+
+  /**
+   * @brief Whether the adaptive bitrate controller holds this session's frames to its budget and pacing.
+   *
+   * The hold lives on the session's own sender; when its timer could not be created the session
+   * rides the broadcast thread, which serves every session and must not wait on one's budget.
+   *
+   * @param session The session.
+   * @return False once the own sender failed to start.
+   */
+  bool controller_holds_frames(session_t &session) {
+    std::lock_guard lg {session.video.sender_lock};
+    return !session.video.sender_failed;
+  }
+
+  std::pair<std::chrono::steady_clock::time_point, std::optional<std::uint16_t>> frame_send_timing(
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point next_frame_start,
+    std::optional<std::chrono::steady_clock::time_point> captured,
+    double budget_bps,
+    std::chrono::steady_clock::time_point paid_until
+  ) {
+    // Don't ignore the last ratecontrol group of the previous frame
+    auto start = std::max(next_frame_start, now);
+
+    // With the adaptive controller, a frame also waits until the previous ones are paid for
+    // at the budget. Frames the size of the budget never wait; larger ones —encoded for the
+    // budget before the last cut, or an encoder overshooting at a scene change— are held
+    // here instead of flooding the path's queue: that costs delay, a lost packet costs a key
+    // frame. Never more than a quarter of a second, so an encoder that keeps overshooting
+    // cannot pile up delay without end. And never for a frame already late: the queue from the
+    // encoder holds 32 frames and empties itself entirely when it fills, so holding every
+    // frame back while it grows loses half a second of video at once — and the client, seeing
+    // the gap, asks for a key frame. Past 120 ms since capture a frame goes out unheld, which
+    // keeps that queue to a handful of frames.
+    const bool late = captured && now - *captured > 120ms;
+    if (budget_bps > 0 && !late) {
+      start = std::max(start, std::min(paid_until, now + 250ms));
+    }
+
+    if (!captured) {
+      return {start, std::nullopt};
+    }
+    // From capture to when the frame starts to leave, the hold included. A frame the controller does not
+    // hold reports upstream's figure, to now: the wait for the previous frame's pacing is not in it.
+    const auto reported = budget_bps > 0 ? start : now;
+    const auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(reported - *captured).count();
+    return {start, static_cast<std::uint16_t>(std::clamp<decltype(latency_us)>((latency_us + 50) / 100, 0, std::numeric_limits<std::uint16_t>::max()))};
+  }
+
+  /**
+   * @brief Hand a frame to the session's own sender, when the controller paces the session on one.
+   *
+   * @param session The session the frame belongs to.
+   * @param packet The frame; moved to the session's queue only when it is handed over.
+   * @param sock Socket the session's own sender writes to.
+   * @param video_epoch Origin of the RTP timestamps.
+   * @param make_timer Creates the timer that paces the own sender.
+   * @return True when the session's own sender has the frame, false when the calling thread sends it.
+   */
+  bool hand_off_to_own_sender(session_t &session, video::packet_t &packet, udp::socket &sock, std::chrono::steady_clock::time_point video_epoch, const std::function<std::unique_ptr<platf::high_precision_timer>()> &make_timer) {
+    if (!session.adaptive || !session.adaptive->own_sender()) {
+      return false;
+    }
+    auto own = own_sender_queue(session, sock, video_epoch, make_timer);
+    if (!own) {
+      return false;
+    }
+    own->raise(std::move(packet));
+    return true;
+  }
+
+  /**
+   * @brief The rate at which the controller paces a session's frames.
+   *
+   * @param session The session.
+   * @param holds Whether the controller holds the session's frames (controller_holds_frames).
+   * @param now Current time.
+   * @return Bits per second, or 0 for the stream's default pacing.
+   */
+  double controller_pacing_bps(session_t &session, bool holds, std::chrono::steady_clock::time_point now) {
+    return holds ? session.adaptive->frame_pacing_bps(now) : 0.0;
+  }
+
+  /**
+   * @brief Record what a sent frame owes the session's budget and report it to the controller.
    *
    * @param session The session the frame belongs to.
    * @param packet The frame.
+   * @param frame_start When the frame's packets started to leave, by the pacing.
+   * @param budget_bps The controller's budget, 0 without a holding controller.
    * @param first_send When the first packet actually left, if any did.
    * @param last_send When the last batch left.
    * @param packets Packets sent, parity included.
    * @param data_packets Data packets sent.
    * @param rtp_bytes RTP bytes sent.
    * @param wire_bytes Bytes on the wire, headers included.
+   * @param pay_multiple The multiple of the budget the frame is paid at, from the decision it was sent with.
+   * @param padded Whether the frame is a probe padded with extra parity.
    */
-  void report_frame(session_t &session, video::packet_raw_t &packet, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes) {
+  void report_frame(session_t &session, video::packet_raw_t &packet, std::chrono::steady_clock::time_point frame_start, double budget_bps, std::optional<std::chrono::steady_clock::time_point> first_send, std::chrono::steady_clock::time_point last_send, int packets, int data_packets, double rtp_bytes, double wire_bytes, double pay_multiple, bool padded) {
+    if (budget_bps > 0) {
+      session.video.paid_until = stream::paid_until(frame_start, wire_bytes, budget_bps, pay_multiple);
+    }
     if (session.adaptive && first_send) {
       if (packet.frame_timestamp) {
         session.adaptive->host_delay(*first_send - *packet.frame_timestamp);
       }
-      session.adaptive->frame_sent((uint32_t) packet.frame_index(), *first_send, last_send, packets, data_packets, rtp_bytes, wire_bytes);
+      session.adaptive->frame_sent((uint32_t) packet.frame_index(), *first_send, last_send, packets, data_packets, rtp_bytes, wire_bytes, padded);
     }
   }
 
   /**
-   * @brief Set where a session's video goes and from which local address.
+   * @brief Set where a session's video goes and from which local address. Only the tests call it.
    *
    * @param session The session.
    * @param peer The client's video endpoint.
@@ -1735,13 +1914,27 @@ namespace stream {
     session.localAddress = local;
   }
 
-  void videoBroadcastThread(udp::socket &sock) {
+  /**
+   * @brief When the session's frames sent so far are paid for at the controller's budget. Only the tests call it.
+   *
+   * @param session The session.
+   * @return The instant, as report_frame recorded it.
+   */
+  std::chrono::steady_clock::time_point video_paid_until(const session_t &session) {
+    return session.video.paid_until;
+  }
+
+  double video_host_delay_s(const session_t &session) {
+    return session.adaptive ? session.adaptive->host_delay_s() : 0.0;
+  }
+
+  void videoSendThread(udp::socket &sock, std::chrono::steady_clock::time_point video_epoch, std::shared_ptr<safe::queue_t<video::packet_t>> own_packets, std::unique_ptr<platf::high_precision_timer> timer) {
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
-    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
-    auto video_epoch = std::chrono::steady_clock::now();
+    const bool broadcast = !own_packets;
+    std::shared_ptr<safe::queue_t<video::packet_t>> packets = broadcast ? mail::man->queue<video::packet_t>(mail::video_packets) : own_packets;
 
     // Video traffic is sent on this thread
-    platf::set_thread_name("stream::videoBroadcast");
+    platf::set_thread_name(broadcast ? "stream::videoBroadcast" : "stream::videoSend");
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
     logging::min_max_avg_periodic_logger<double> frame_processing_latency_logger(debug, "Frame processing latency", "ms");
@@ -1752,7 +1945,9 @@ namespace stream {
 
     crypto::aes_t iv(12);
 
-    auto timer = platf::create_high_precision_timer();
+    if (broadcast) {
+      timer = platf::create_high_precision_timer();
+    }
     if (!timer || !*timer) {
       BOOST_LOG(error) << "Failed to create timer, aborting video broadcast thread";
       return;
@@ -1765,9 +1960,19 @@ namespace stream {
         break;
       }
 
+      auto *session = packet->channel_data;
+      try {
+        if (broadcast && hand_off_to_own_sender(*session, packet, sock, video_epoch, platf::create_high_precision_timer)) {
+          continue;
+        }
+      } catch (const std::exception &e) {
+        // Starting the session's sender failed: the frame is dropped, as any frame whose sending throws
+        BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
+        continue;
+      }
+
       frame_network_latency_logger.first_point_now();
 
-      auto *session = packet->channel_data;
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1797,21 +2002,19 @@ namespace stream {
         frame_header.lastPayloadLen = session->config.packetsize - sizeof(NV_VIDEO_PACKET);
       }
 
-      if (packet->frame_timestamp) {
-        auto duration_to_latency = [](const std::chrono::steady_clock::duration &duration) {
-          const auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-          return (uint16_t) std::clamp<decltype(duration_us)>((duration_us + 50) / 100, 0, std::numeric_limits<uint16_t>::max());
-        };
-
-        uint16_t latency = duration_to_latency(std::chrono::steady_clock::now() - *packet->frame_timestamp);
-        frame_header.frame_processing_latency = latency;
-        frame_processing_latency_logger.collect_and_log(latency / 10.);
-      } else {
-        frame_header.frame_processing_latency = 0;
-      }
-
+      // With the adaptive controller a frame may be held until the previous ones are paid for at
+      // the budget (frame_send_timing)
       // The controller's decisions are read once, so the frame is sized on one consistent set
       const auto decision = session->adaptive ? session->adaptive->decision() : nullptr;
+      const bool holds = session->adaptive && controller_holds_frames(*session);
+      const double budget_bps = holds ? session->adaptive->budget_bps(*decision) : 0.0;
+      const auto timing = frame_send_timing(std::chrono::steady_clock::now(), ratecontrol_next_frame_start, packet->frame_timestamp, budget_bps, session->video.paid_until);
+      const auto ratecontrol_frame_start = timing.first;
+      const auto latency = timing.second;
+      frame_header.frame_processing_latency = latency.value_or(0);
+      if (latency) {
+        frame_processing_latency_logger.collect_and_log(*latency / 10.);
+      }
 
       auto fecPercentage = session->adaptive ? session->adaptive->fec_percentage(config::stream.fec_percentage, *decision) : config::stream.fec_percentage;
 
@@ -1865,8 +2068,32 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps
-        const auto ratecontrol = pacing(blocksize);
+        // Use around 80% of 1Gbps, or the adaptive controller's pacing when it is lower
+        const auto frame_now = std::chrono::steady_clock::now();
+        const auto probe = holds ? session->adaptive->frame_probe(frame_now) : adaptive_bitrate::session_t::frame_probe_t {};
+        const auto ratecontrol = pacing(blocksize, probe.pacing_bps);
+
+        // A probe the controller wants padded carries extra parity: only the blocks' percentage grows, so the frame's data
+        // shards and the protocol are unchanged, and a frame that cannot reach the size the probe needs goes out as it is.
+        // A frame that repairs a loss or opens a stream is never padded.
+        stream::padding::plan_t pad_plan;
+        if (probe.pad && fecPercentage > 0 && !packet->is_idr() && !packet->after_ref_frame_invalidation) {
+          std::vector<std::size_t> block_shards;
+          int base_percentage = fecPercentage;
+          for (auto it = fec_blocks_begin; it != fec_blocks_end; ++it) {
+            block_shards.push_back((it->size() + (blocksize - 1)) / blocksize);
+            base_percentage = std::max(base_percentage, session->adaptive->block_fec_percentage((int) block_shards.back(), false, *decision));
+          }
+          const double wire_packet_bytes = (double) (blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0) + session->config.ipHeaderBytes);
+          const auto packets_for = [&](double buckets) {
+            return (std::size_t) std::ceil(buckets * abr::cal::kProbePadBucket / wire_packet_bytes);
+          };
+          const auto pad_min_parity = session->adaptive->min_parity(session->config.minRequiredFecPackets, *decision);
+          pad_plan = stream::padding::plan(block_shards, (std::size_t) base_percentage, (std::size_t) std::max(0, pad_min_parity), packets_for(abr::cal::kProbePadK), packets_for(abr::cal::kProbePadMinK));
+          if (pad_plan.padded) {
+            session->adaptive->padded(frame_now, (double) pad_plan.extra_parity * wire_packet_bytes * 8.0);
+          }
+        }
         const size_t ratecontrol_packets_in_1ms = ratecontrol.packets_in_1ms;
 
         // Send less than 64K in a single batch.
@@ -1878,9 +2105,7 @@ namespace stream {
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
-
-        // Don't ignore the last ratecontrol group of the previous frame
-        auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
+        send_batch_size = ratecontrol.batch_size(send_batch_size);
 
         size_t ratecontrol_frame_packets_sent = 0;
         size_t ratecontrol_group_packets_sent = 0;
@@ -1900,7 +2125,11 @@ namespace stream {
         const auto rtp_frame_time = packet->frame_timestamp.value_or(ratecontrol_next_frame_start);
 
         auto blockIndex = 0;
+        bool abandoned = false;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
+          if (abandoned) {
+            return;
+          }
           auto payload_packets = (current_payload.size() + (blocksize - 1)) / blocksize;
 
           for (int x = 0; x < payload_packets; ++x) {
@@ -1930,6 +2159,9 @@ namespace stream {
             if (pct >= 0) {
               block_fec_percentage = pct;
             }
+          }
+          if (pad_plan.padded) {
+            block_fec_percentage = std::max((int) block_fec_percentage, (int) pad_plan.percentages[blockIndex]);
           }
 
           frame_fec_latency_logger.first_point_now();
@@ -2003,6 +2235,11 @@ namespace stream {
 
                 auto now = std::chrono::steady_clock::now();
                 if (now < due) {
+                  // A stopped queue is a closing session, which waits for this thread: the rest of the frame is dropped
+                  if (!packets->running()) {
+                    abandoned = true;
+                    break;
+                  }
                   timer->sleep_for(due - now);
                 }
 
@@ -2045,6 +2282,9 @@ namespace stream {
               next_shard_to_send = x + 1;
             }
           }
+          if (abandoned) {
+            return;
+          }
 
           // remember this in case the next frame comes immediately
           ratecontrol_next_frame_start = ratecontrol_frame_start + ratecontrol.due(ratecontrol_frame_packets_sent);
@@ -2065,17 +2305,23 @@ namespace stream {
           ++blockIndex;
           lowseq += shards.size();
         });
+        if (abandoned) {
+          break;
+        }
 
         session->video.lowseq = lowseq;
 
-        report_frame(*session, *packet, frame_first_send, frame_last_send, frame_packets, frame_data_packets, frame_rtp_bytes, frame_wire_bytes);
+        report_frame(*session, *packet, ratecontrol_frame_start, budget_bps, frame_first_send, frame_last_send, frame_packets, frame_data_packets, frame_rtp_bytes, frame_wire_bytes, decision ? decision->pay_multiple : 1.1, pad_plan.padded);
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
       }
     }
 
-    shutdown_event->raise(true);
+    // A session's sender ends with its session; only the broadcast sender ending brings the broadcast down
+    if (broadcast) {
+      shutdown_event->raise(true);
+    }
   }
 
   /**
@@ -2249,7 +2495,8 @@ namespace stream {
 
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
-    ctx.video_thread = std::jthread {videoBroadcastThread, std::ref(ctx.video_sock)};
+    ctx.video_epoch = std::chrono::steady_clock::now();
+    ctx.video_thread = std::jthread {videoSendThread, std::ref(ctx.video_sock), ctx.video_epoch, nullptr, nullptr};
     ctx.audio_thread = std::jthread {audioBroadcastThread, std::ref(ctx.audio_sock)};
     ctx.control_thread = std::jthread {controlBroadcastThread, &ctx.control_server};
 
@@ -2431,6 +2678,13 @@ namespace stream {
     }
 
     /**
+     * @brief Bitrate an encoder reopened during the session opens at.
+     */
+    int encoder_open_kbps(const session_t *session) {
+      return session && session->adaptive ? session->adaptive->initial_encoder_kbps() : 0;
+    }
+
+    /**
      * @brief Stop the active streaming session and prevent new packets from being queued.
      */
     void stop(session_t &session) {
@@ -2464,6 +2718,7 @@ namespace stream {
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
       session.videoThread.join();
+      close_own_sender(session);
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
@@ -2597,6 +2852,8 @@ namespace stream {
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.ltr_ack_events = mail->event<std::uint32_t>(mail::ltr_ack);
+      session->video.bitrate_events = mail->event<int>(mail::bitrate);
+      session->video.bitrate_fixed_events = mail->event<int>(mail::bitrate_fixed);
       session->video.repair_reach_events = mail->event<int>(mail::repair_reach);
       session->video.frame_divider_events = mail->event<int>(mail::frame_divider);
       session->video.lowseq = 0;
