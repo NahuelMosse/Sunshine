@@ -168,6 +168,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/compat/moonlight.h"
         "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
+        "${CMAKE_SOURCE_DIR}/src/adaptive_bitrate.cpp"
+        "${CMAKE_SOURCE_DIR}/src/adaptive_bitrate.h"
         "${CMAKE_SOURCE_DIR}/src/abr/control.cpp"
         "${CMAKE_SOURCE_DIR}/src/abr/control.h"
         "${CMAKE_SOURCE_DIR}/src/abr/params.cpp"
