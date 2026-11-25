@@ -561,17 +561,31 @@ namespace abr {
     if (t_ - t_cut_ > kWayBackS) {
       reexplore_wait_ = 0;
     }
-    const double wait = reexplore_wait_ > 0 ? reexplore_wait_ : kReexploreS;
+    // After a cut this loop made itself, once its own queue drained and the trains measured the new pipe, the wait for the
+    // re-exploration is only the calm that makes a proof trustworthy, and the climb stops at the pipe the trains measured
+    // after the cut: the long wait idled the budget under the settled band while the pipe was free.
+    bool early = false;
+    double early_cap = 0;
+    if (startup_done_ && !unquiet_ && !competitor_ && !return_refuted_ && reexplore_wait_ <= 0 && pipe_after_cut_ > 0 && t_ >= early_block_until_ && std::min(pipe_after_cut_, C_est_) < cal::kEarlyDepth * pipe_before_cut_ && t_ - t_cut_ < cal::kCutEpisodeS && t_bandwidth_ > t_cut_ && t_ - t_last_queue_ > kQuietFrameProofIdleS) {
+      early_cap = cal::kEarlyShare * std::min(pipe_after_cut_, C_est_);
+      early = early_cap > R_;  // nothing to explore under the cap: it is not a re-exploration
+    }
+    const double wait = early ? kQuietFrameProofIdleS : (reexplore_wait_ > 0 ? reexplore_wait_ : kReexploreS);
     // On a clean path with arrival jitter the queue shows late, and the fast pace would run past the pipe every few seconds under a
     // ceiling the jitter inflates. While the frames spread and their measure is fresh, it says where the pipe is.
     const bool measured = unquiet_ && t_ - t_loss_ > tun::kEstimationWindow && train_bandwidth_ > 0 && t_ - t_bandwidth_ < kProofFreshS &&
                           trains_representative();
     const bool no_queue = ((kReexploreS > 0 && t_ - t_last_queue_ > wait) || after_cross_) && !measured;
     if (tun::kRiseRate > 0 && (!startup_done_ || no_queue)) {
-      if (startup_done_ && t_reexplore_ < t_last_queue_) {
+      if (startup_done_ && t_reexplore_ < t_last_queue_ && !(early && t_ - t_last_queue_ <= kReexploreS)) {
         t_reexplore_ = t_;
       }
-      const double fast = R_ * (1.0 + tun::kRiseRate * p_.Tc);
+      double fast = R_ * (1.0 + tun::kRiseRate * p_.Tc);
+      // Only the exploration the early wait allows is capped; once the usual wait elapsed the climb is the ordinary one
+      if (early && t_ - t_last_queue_ <= kReexploreS) {
+        fast = std::min(fast, std::max(R_, early_cap));
+        t_early_ = t_;
+      }
       target = std::max(target, fast);
     }
     R_ = std::max(R_, std::min(p_.bitrate_max, target));
@@ -775,6 +789,7 @@ namespace abr {
     sent_smooth_ = received_smooth_ = 0;
     t_last_queue_ = 0;
     t_reexplore_ = -1e9;
+    t_early_ = early_block_until_ = -1e9;
     reexplore_wait_ = 0;
     narrower_streak_ = 0;
     alarm_received_ = 0;
@@ -826,6 +841,10 @@ namespace abr {
       // one before the first. The pipe it ran on is the one that delivered what was arriving over the last window,
       // at the utilization the budget keeps: what arrived cannot exceed the pipe, while the trains can read it double
       // behind a router's burst.
+      // A cut that ends an early re-exploration says the pipe measure over-read it: the usual wait is kept for a while
+      if (m.t - t_early_ < cal::kCutEpisodeS) {
+        early_block_until_ = m.t + kWayBackS;
+      }
       const bool same_episode = m.t - t_cut_ < cal::kCutEpisodeS;
       budget_before_cut_ = same_episode ? std::max(budget_before_cut_, budget_prev_) : budget_prev_;
       double delivered = 0;

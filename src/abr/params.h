@@ -495,6 +495,8 @@ namespace abr {
 
     constexpr double kCutFraction = 0.85;  ///< a step that leaves the budget below this share of the previous one is a cut
     constexpr double kCutEpisodeS = 5.0;  ///< seconds within which a cut that follows another is the same episode
+    constexpr double kEarlyShare = 0.82;  ///< an early re-exploration climbs to this share of the pipe measured after the cut: inside the settled band, under the utilization point
+    constexpr double kEarlyDepth = 0.45;  ///< the pipe measured after the cut must be under this share of the pipe before it for an early re-exploration
   }  // namespace cal
 
   /**
